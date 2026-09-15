@@ -36,6 +36,34 @@ logger = logging.getLogger(__name__)
 
 _DISCORD_MARKDOWN_LINK_LABEL_RE = re.compile(r"([\\\[\]])")
 _DISCORD_URL_LABEL_SCHEME_RE = re.compile(r"^https?://", re.IGNORECASE)
+_BOT_CONVERSATION_ROLES = frozenset({
+    "cos", "ceo", "cfo", "cio", "cmo", "coo", "cpo", "cro", "cso", "cto",
+})
+_BOT_CONVERSATION_TYPES = frozenset({
+    "CHAT", "INFO", "QUESTION", "ANSWER", "IDEA", "TASK_PROPOSAL", "RESULT", "BLOCKED",
+    "TASK_CREATED",
+})
+_BOT_CONVERSATION_FIELDS = frozenset({
+    "type", "from", "to", "coordination", "summary", "purpose", "question", "answer",
+    "source_refs", "reply_to", "task_id",
+})
+_BOT_CONVERSATION_FIELD_ALIASES = {
+    "種別": "type", "送信元": "from", "宛先": "to", "話題ID": "coordination",
+    "要約": "summary", "目的": "purpose", "質問": "question", "回答": "answer",
+    "参照元": "source_refs", "返信先": "reply_to", "タスクID": "task_id",
+}
+_BOT_CONVERSATION_FIELD_LIMITS = {
+    "type": 20, "from": 20, "to": 20, "coordination": 80, "summary": 240,
+    "purpose": 160, "question": 220, "answer": 220, "source_refs": 424,
+    "reply_to": 80, "task_id": 120,
+}
+_BOT_CONVERSATION_MAX_CONTENT = 600
+_BOT_CONVERSATION_MAX_SOURCE_REFS = 3
+_BOT_CONVERSATION_MAX_SOURCE_REF_CHARS = 140
+_BOT_CONVERSATION_COORDINATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$")
+_BOT_CONVERSATION_HEADER_RE = re.compile(
+    r"^<@!?([0-9]+)>\s+🧭\s+HERMES-BOT-CHAT\s+v1$"
+)
 
 
 def _voice_mixer_module():
@@ -1377,6 +1405,23 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return False, False
         role_authorized = False
         if getattr(message.author, "bot", False):
+            is_bot_conversation = self._discord_is_bot_conversation_message(message)
+            if (
+                self._discord_bot_conversation_channel_id()
+                and not is_bot_conversation
+            ):
+                # Once internal bot-chat is configured, keep bot-authored turns off every other
+                # channel so a mention cannot turn a normal work channel into a relay bus.
+                return False, False
+            if is_bot_conversation:
+                known_bot_ids = self._discord_known_bot_ids()
+                author_id = str(getattr(message.author, "id", "")).strip()
+                # The dedicated channel accepts only identities owned by this gateway.  The
+                # structured envelope is not an authentication mechanism by itself.
+                if not author_id or author_id not in known_bot_ids:
+                    return False, False
+                if not self._discord_bot_conversation_protocol_is_valid(message):
+                    return False, False
             allow_bots = self._get_allow_bots()
             if allow_bots == "none":
                 return False, False
@@ -4703,6 +4748,144 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         raw = self._gate_raw("allow_bots", "DISCORD_ALLOW_BOTS")
         return str(raw or "none").lower().strip() or "none"
 
+    def _discord_bot_conversation_channel_id(self) -> Optional[str]:
+        """Return the exact internal bot-conversation channel, or None when it is not configured."""
+        extra = getattr(self.config, "extra", None)
+        settings = extra.get("bot_conversation") if isinstance(extra, dict) else None
+        channel_id = settings.get("channel_id") if isinstance(settings, dict) else None
+        channel_id = str(channel_id or "").strip()
+        return channel_id if channel_id.isdigit() else None
+
+    def _discord_is_bot_conversation_message(self, message: Any) -> bool:
+        """True only for the configured bot-lounge text channel."""
+        channel_id = self._discord_bot_conversation_channel_id()
+        if not channel_id:
+            return False
+        channel = getattr(message, "channel", None)
+        current_id = str(getattr(channel, "id", "")).strip()
+        return current_id == channel_id
+
+    @staticmethod
+    def _discord_bot_conversation_role(profile: Optional[str]) -> str:
+        role = str(profile or "default").strip().lower()
+        return "cos" if role in {"", "default", "chief-of-staff", "chief_of_staff"} else role
+
+    def _discord_bot_conversation_identity_roles(self) -> dict[str, set[str]]:
+        """Map live Hermes Discord identities to their served role labels."""
+        result: dict[str, set[str]] = {}
+        runner = getattr(self, "gateway_runner", None)
+        adapter_maps = []
+        if runner is not None:
+            adapter_maps.append((None, getattr(runner, "adapters", None) or {}))
+            adapter_maps.extend(
+                (profile, adapters)
+                for profile, adapters in (getattr(runner, "_profile_adapters", None) or {}).items()
+            )
+        owner_profile = getattr(self, "_owner_profile", None)
+        if owner_profile is not None:
+            adapter_maps.append((owner_profile, {Platform.DISCORD: self}))
+        for profile, adapters in adapter_maps:
+            if not isinstance(adapters, dict):
+                continue
+            adapter = adapters.get(Platform.DISCORD) or adapters.get("discord")
+            user = getattr(getattr(adapter, "_client", None), "user", None)
+            user_id = str(getattr(user, "id", "")).strip()
+            role = self._discord_bot_conversation_role(profile)
+            if user_id.isdigit() and role in _BOT_CONVERSATION_ROLES:
+                result.setdefault(user_id, set()).add(role)
+        return result
+
+    def _discord_bot_conversation_protocol_is_valid(self, message: Any) -> bool:
+        """Reject bot-lounge traffic unless it is a single-recipient structured envelope."""
+        channel = getattr(message, "channel", None)
+        channel_id = self._discord_bot_conversation_channel_id()
+        if not channel_id or str(getattr(channel, "id", "") or "").strip() != channel_id:
+            return False
+        if (
+            getattr(message, "attachments", None)
+            or getattr(message, "message_snapshots", None)
+            or getattr(message, "embeds", None)
+        ):
+            return False
+        if getattr(message, "reference", None) is not None:
+            return False
+        content = str(getattr(message, "content", "") or "")
+        if len(content) > _BOT_CONVERSATION_MAX_CONTENT:
+            return False
+        lines = content.splitlines()
+        if len(lines) < 4:
+            return False
+        own_user = getattr(getattr(self, "_client", None), "user", None)
+        own_id = str(getattr(own_user, "id", "") or "").strip()
+        header = _BOT_CONVERSATION_HEADER_RE.fullmatch(lines[0].strip())
+        if not own_id or not header or header.group(1) != own_id:
+            return False
+        raw_mentions = re.findall(r"<@!?([0-9]+)>", content)
+        if raw_mentions != [own_id] or re.search(r"(?i)(?:@everyone|@here|<@&[0-9]+>)", content):
+            return False
+        fields: dict[str, str] = {}
+        for line in lines[1:]:
+            parts = line.split() if line.startswith(("type=", "種別=")) else [line]
+            for part in parts:
+                raw_key, separator, value = part.partition("=")
+                key = _BOT_CONVERSATION_FIELD_ALIASES.get(raw_key.strip(), raw_key.strip())
+                value = value.strip()
+                if (
+                    not separator or not key or key in fields or key not in _BOT_CONVERSATION_FIELDS
+                    or len(value) > _BOT_CONVERSATION_FIELD_LIMITS[key]
+                ):
+                    return False
+                fields[key] = value
+        if "source_refs" in fields:
+            source_refs = [part.strip() for part in fields["source_refs"].split(",")]
+            if (
+                len(source_refs) > _BOT_CONVERSATION_MAX_SOURCE_REFS
+                or any(
+                    not ref or len(ref) > _BOT_CONVERSATION_MAX_SOURCE_REF_CHARS
+                    for ref in source_refs
+                )
+            ):
+                return False
+        required = {"type", "from", "to", "coordination", "summary"}
+        if not required.issubset(fields):
+            return False
+        message_type = fields["type"].upper()
+        sender_role = fields["from"].lower()
+        recipient_role = fields["to"].lower()
+        if (
+            message_type not in _BOT_CONVERSATION_TYPES
+            or sender_role not in _BOT_CONVERSATION_ROLES
+            or recipient_role not in _BOT_CONVERSATION_ROLES
+            or sender_role == recipient_role
+            or not _BOT_CONVERSATION_COORDINATION_RE.fullmatch(fields["coordination"])
+            or not fields["summary"]
+        ):
+            return False
+        receiver_role = self._discord_bot_conversation_role(getattr(self, "_owner_profile", None))
+        if recipient_role != receiver_role:
+            return False
+        author_id = str(getattr(getattr(message, "author", None), "id", "")).strip()
+        identity_roles = self._discord_bot_conversation_identity_roles()
+        return identity_roles.get(author_id) == {sender_role}
+
+    def _discord_known_bot_ids(self) -> set[str]:
+        """Return live Hermes bot identities; empty means fail closed."""
+        ids: set[str] = set()
+        runner = getattr(self, "gateway_runner", None)
+        adapter_maps = []
+        if runner is not None:
+            adapter_maps.append(getattr(runner, "adapters", None) or {})
+            adapter_maps.extend((getattr(runner, "_profile_adapters", None) or {}).values())
+        for adapters in adapter_maps:
+            if not isinstance(adapters, dict):
+                continue
+            adapter = adapters.get(Platform.DISCORD) or adapters.get("discord")
+            user = getattr(getattr(adapter, "_client", None), "user", None)
+            user_id = str(getattr(user, "id", "")).strip()
+            if user_id.isdigit() and getattr(user, "bot", False):
+                ids.add(user_id)
+        return ids
+
     def _discord_free_response_channels(self) -> set:
         """Channel IDs/names needing no mention; a lone "*" is preserved for wildcard short-circuit."""
         raw = self.config.extra.get("free_response_channels")
@@ -6660,6 +6843,17 @@ def _standalone_warn_missing_media(media_path: str) -> str:
     return warning
 
 
+def _standalone_bot_conversation_allowed_mentions(message: str) -> Optional[dict]:
+    """Return an allowlist for the one recipient mention in an internal bot envelope."""
+    mentions = re.findall(r"<@!?([0-9]+)>", str(message or ""))
+    if (
+        len(mentions) != 1
+        or re.search(r"(?i)(?:@everyone|@here|<@&[0-9]+>)", str(message or ""))
+    ):
+        return None
+    return {"parse": [], "users": [mentions[0]], "roles": [], "replied_user": False}
+
+
 async def _standalone_response_json_or_error(resp: Any, error_prefix: str):
     """``(data, None)`` for a 200/201 JSON response, else ``(None, {"error": ...})``
     with the (size-capped) body text appended to ``error_prefix``."""
@@ -6669,8 +6863,10 @@ async def _standalone_response_json_or_error(resp: Any, error_prefix: str):
     return await _standalone_read_json_limited(resp, _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES), None
 
 
-async def _standalone_is_forum(aiohttp, chat_id: str, json_headers: dict, sess_kw: dict, req_kw: dict) -> bool:
-    """Forum detection: channel directory → process-local probe cache → memoized ``GET /channels/{id}``."""
+async def _standalone_channel_kind(
+    aiohttp, chat_id: str, json_headers: dict, sess_kw: dict, req_kw: dict,
+) -> Optional[str]:
+    """Return ``text``, ``forum``, ``media``, or None when Discord's channel type is unknown."""
     _channel_type = None
     try:
         from gateway.channel_directory import lookup_channel_type
@@ -6678,27 +6874,34 @@ async def _standalone_is_forum(aiohttp, chat_id: str, json_headers: dict, sess_k
     except Exception:
         pass
     if _channel_type is not None:
-        return _channel_type == "forum"
+        return {"channel": "text", "forum": "forum", "media": "media"}.get(_channel_type)
     cached = _probe_is_forum_cached(chat_id)
     if cached is not None:
-        return cached
-    is_forum = False
+        return "forum" if cached else "text"
     try:
         info_url = f"https://discord.com/api/v10/channels/{chat_id}"
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15), **sess_kw) as info_sess:
             async with info_sess.get(info_url, headers=json_headers, **req_kw) as info_resp:
                 if info_resp.status == 200:
                     info = await _standalone_read_json_limited(info_resp, _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES)
-                    is_forum = info.get("type") == 15
-                    _remember_channel_is_forum(chat_id, is_forum)
+                    channel_kind = {0: "text", 5: "text", 15: "forum", 16: "media"}.get(info.get("type"))
+                    if channel_kind in {"text", "forum"}:
+                        _remember_channel_is_forum(chat_id, channel_kind == "forum")
+                    return channel_kind
     except Exception:
         logger.debug("Failed to probe channel type for %s", chat_id, exc_info=True)
-    return is_forum
+    return None
+
+
+async def _standalone_is_forum(aiohttp, chat_id: str, json_headers: dict, sess_kw: dict, req_kw: dict) -> bool:
+    """Forum detection: channel directory → process-local probe cache → memoized REST probe."""
+    return await _standalone_channel_kind(aiohttp, chat_id, json_headers, sess_kw, req_kw) == "forum"
 
 
 async def _standalone_send(
     pconfig, chat_id: str, message: str, *, thread_id: Optional[str] = None,
     media_files: Optional[list] = None, force_document: bool = False, caption: Optional[str] = None,
+    internal_bot_conversation: bool = False,
 ) -> Dict[str, Any]:
     """Send via Discord REST without a live gateway adapter (token: ``pconfig.token`` then env var).
     Forum channels (type 15) reject ``POST /messages``, so a thread post is created via
@@ -6722,13 +6925,37 @@ async def _standalone_send(
         auth_headers = {"Authorization": f"Bot {token}"}
         json_headers = {**auth_headers, "Content-Type": "application/json"}
         media_files = media_files or []
+        allowed_mentions = None
+        if internal_bot_conversation:
+            bot_settings = (getattr(pconfig, "extra", {}) or {}).get("bot_conversation")
+            configured_channel_id = (
+                str(bot_settings.get("channel_id") or "").strip()
+                if isinstance(bot_settings, dict) else ""
+            )
+            if not configured_channel_id or str(chat_id).strip() != configured_channel_id:
+                return {"error": "Refusing internal bot conversation: only the configured bot-lounge text channel is allowed"}
+            if thread_id:
+                return {"error": "Internal bot conversation cannot target a Discord thread"}
+            allowed_mentions = _standalone_bot_conversation_allowed_mentions(message)
+            if allowed_mentions is None or media_files:
+                return {"error": "Internal bot conversation send must be text-only with one recipient mention"}
         last_data = None
         warnings = []
         if thread_id:
             url = f"https://discord.com/api/v10/channels/{thread_id}/messages"
         else:
+            if internal_bot_conversation:
+                internal_channel_kind = await _standalone_channel_kind(
+                    aiohttp, chat_id, json_headers, _sess_kw, _req_kw
+                )
+                if internal_channel_kind != "text":
+                    if internal_channel_kind == "forum":
+                        return {"error": "Internal bot conversation requires a text channel; forum threads are disabled"}
+                    return {"error": "Internal bot conversation requires a configured text channel; forum/media/unknown channels are disabled"}
             # Forum channels (type 15) reject POST /messages — create a thread post.
             if await _standalone_is_forum(aiohttp, chat_id, json_headers, _sess_kw, _req_kw):
+                if internal_bot_conversation:
+                    return {"error": "Internal bot conversation requires a text channel; forum threads are disabled"}
                 thread_name = _derive_forum_thread_name(message)
                 thread_url = f"https://discord.com/api/v10/channels/{chat_id}/threads"
                 # Filter readable media first to pick JSON vs multipart before opening a session.
@@ -6746,6 +6973,8 @@ async def _standalone_send(
                             for idx, path in enumerate(valid_media)
                         ]
                         starter_message = {"content": (caption or message), "attachments": attachments_meta}
+                        if allowed_mentions is not None:
+                            starter_message["allowed_mentions"] = allowed_mentions
                         payload_json = json.dumps({"name": thread_name, "message": starter_message})
                         form = aiohttp.FormData()
                         form.add_field("payload_json", payload_json, content_type="application/json")
@@ -6764,9 +6993,12 @@ async def _standalone_send(
                             return {"error": _standalone_sanitize_error(f"Discord forum thread upload failed: {e}")}
                     else:
                         # No media: JSON POST creates the thread with the text starter.
+                        starter_payload = {"name": thread_name, "message": {"content": message}}
+                        if allowed_mentions is not None:
+                            starter_payload["message"]["allowed_mentions"] = allowed_mentions
                         async with session.post(
                             thread_url, headers=json_headers,
-                            json={"name": thread_name, "message": {"content": message}}, **_req_kw,
+                            json=starter_payload, **_req_kw,
                         ) as resp:
                             data, err = await _standalone_response_json_or_error(resp, "Discord forum thread creation error")
                             if err:
@@ -6783,7 +7015,11 @@ async def _standalone_send(
             url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
             if message.strip() or not media_files:
-                async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
+                payload = {"content": message}
+                if allowed_mentions is not None:
+                    payload["allowed_mentions"] = allowed_mentions
+                    payload["flags"] = 4
+                async with session.post(url, headers=json_headers, json=payload, **_req_kw) as resp:
                     last_data, err = await _standalone_response_json_or_error(resp, "Discord API error")
                     if err:
                         return err
@@ -6796,7 +7032,9 @@ async def _standalone_send(
                     if caption_pending:
                         try:
                             async with session.post(
-                                url, headers=json_headers, json={"content": caption}, **_req_kw,
+                                url, headers=json_headers,
+                                json={"content": caption, **({"allowed_mentions": allowed_mentions}
+                                    if allowed_mentions is not None else {})}, **_req_kw,
                             ) as resp:
                                 if resp.status in {200, 201}:
                                     last_data = await _standalone_read_json_limited(
@@ -6811,7 +7049,11 @@ async def _standalone_send(
                     filename = os.path.basename(media_path)
                     if caption_pending:
                         form.add_field(
-                            "payload_json", json.dumps({"content": caption}),
+                            "payload_json", json.dumps({
+                                "content": caption,
+                                **({"allowed_mentions": allowed_mentions}
+                                   if allowed_mentions is not None else {}),
+                            }),
                             content_type="application/json",
                         )
                         caption_pending = False

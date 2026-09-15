@@ -7,7 +7,9 @@ imported lazily from ``agent.conversation_loop`` (no cycle, same logger name).""
 from __future__ import annotations
 
 import logging
+import json
 import os
+import re
 from contextlib import suppress
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -16,6 +18,7 @@ from agent.context_compressor import _DB_PERSISTED_MARKER
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
 from agent.message_sanitization import _sanitize_surrogates
+from agent.turn_context import drop_stale_api_content
 
 # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
 # returned/live history to avoid role-alternation breaks; the assistant response is
@@ -249,6 +252,7 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
             # blank row's content rather than append a second row.
             _tail["content"] = final_response
             stamp_message_timestamp(_tail)
+            drop_stale_api_content(_tail)
             _tail.pop(_DB_PERSISTED_MARKER, None)
             agent._db_flush_scan_prefix = None
 
@@ -259,6 +263,28 @@ def _close_transcript_tail(agent, messages, final_response, interrupted, _recove
     _apply_override = getattr(agent, "_apply_persist_user_message_override", None)
     if callable(_apply_override):
         _apply_override(messages)
+
+
+def _sync_transcript_final_response(agent, messages, previous_response, final_response) -> None:
+    """Keep the current turn's closing assistant row identical to the returned response."""
+    if previous_response == final_response or not final_response:
+        return
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "user":
+            break
+        if (
+            message.get("role") == "assistant"
+            and flatten_message_text(message.get("content")) == flatten_message_text(previous_response)
+        ):
+            message["content"] = final_response
+            stamp_message_timestamp(message)
+            drop_stale_api_content(message)
+            message.pop(_DB_PERSISTED_MARKER, None)
+            agent._db_flush_scan_prefix = None
+            return
+    append_message(messages, {"role": "assistant", "content": final_response})
 
 
 def _micro_compact_after_turn(agent, messages, final_response, logger) -> None:
@@ -355,6 +381,172 @@ def _append_file_mutation_footer(agent, final_response, logger):
     return final_response
 
 
+_BOT_CHAT_ROLE_RE = re.compile(r"(?i)(?<![A-Z])(CEO|CFO|CIO|CMO|COO|CPO|CRO|CSO|CTO|COS)(?![A-Z])")
+_BOT_CHAT_COORDINATION_RE = re.compile(
+    r"(?i)(?:coordination_id|話題ID)\s*[:=]\s*([A-Za-z0-9][A-Za-z0-9_.:-]{0,79})"
+)
+_BOT_CHAT_SUCCESS_RE = re.compile(
+    r"(?i)(?:送信|配信|投稿|ping|連絡)(?:を)?(?:しました|した|済み|完了|成功|確認)|"
+    r"\b(?:sent|posted|pinged|dispatched)\b"
+)
+_BOT_CHAT_NEGATIVE_RE = re.compile(
+    r"(?i)(?:未(?:送信|配信|確認)|(?:送信|配信|投稿|ping|連絡).{0,16}"
+    r"(?:してい(?:な|ません)|しなかった|でき(?:な|ません|ず)|失敗|不明|予定|してください)|確認できな)"
+)
+_BOT_CHAT_ROLE_TOKEN = r"(?:CEO|CFO|CIO|CMO|COO|CPO|CRO|CSO|CTO|COS)"
+
+
+def _claimed_bot_chat_deliveries(text: str) -> set[tuple[str, str]]:
+    """Return positive ``(recipient, coordination_id)`` claims; either may be empty."""
+    if not isinstance(text, str):
+        return set()
+    clean_lines, fenced = [], False
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            fenced = not fenced
+            continue
+        stripped = line.strip()
+        if fenced or line.lstrip().startswith(">") or (
+            stripped.startswith("`") and stripped.endswith("`") and stripped.count("`") == 2
+        ):
+            continue
+        line = re.sub(r"`([^`]*)`", r"\1", line)
+        line = re.sub(r"「[^」]*」|“[^”]*”|\"[^\"]*\"", "", line)
+        clean_lines.append(line)
+
+    claimed: set[tuple[str, str]] = set()
+    status_lines: set[int] = set()
+    status_roles: list[str] = []
+    status_id = ""
+    for index, line in enumerate(clean_lines):
+        role_field = re.search(rf"(?i)(?:宛先|recipient(?:_role)?)\s*[:=]\s*((?:{_BOT_CHAT_ROLE_TOKEN}[、,・と及び/&\s]*)+)", line)
+        id_field = _BOT_CHAT_COORDINATION_RE.search(line)
+        delivery_field = re.search(r"(?i)delivery\s*[:=]\s*sent\b", line)
+        if role_field:
+            status_roles = [m.group(1).lower() for m in _BOT_CHAT_ROLE_RE.finditer(role_field.group(1))]
+            status_id = ""
+            status_lines.add(index)
+        if id_field and status_roles:
+            status_id = id_field.group(1)
+            status_lines.add(index)
+        if delivery_field and status_roles:
+            status_lines.add(index)
+            claimed.update((role, status_id) for role in status_roles)
+            status_roles, status_id = [], ""
+
+    recipient_list = rf"({_BOT_CHAT_ROLE_TOKEN}(?:\s*[、,・と及び/&]\s*{_BOT_CHAT_ROLE_TOKEN})*)"
+    for index, line in enumerate(clean_lines):
+        if index in status_lines:
+            continue
+        for success in _BOT_CHAT_SUCCESS_RE.finditer(line):
+            local_start = max(line.rfind(mark, 0, success.start()) for mark in ("、", ",", ";", "；")) + 1
+            connectors = list(re.finditer(r"(?:でしたが|ですが|だが|けれど|しかし)", line[:success.start()]))
+            if connectors:
+                local_start = max(local_start, connectors[-1].end())
+            local_end_candidates = [line.find(mark, success.end()) for mark in ("、", ",", ";", "；", "。", "！", "？")]
+            local_end = min((end for end in local_end_candidates if end >= 0), default=len(line))
+            local = line[local_start:local_end]
+            if _BOT_CHAT_NEGATIVE_RE.search(local) or re.search(
+                r"(?i)\b(?:not|never)\b.{0,24}\b(?:sent|posted|pinged|dispatched)\b|"
+                r"(?:送信|配信|投稿|連絡)したわけでは(?:ありません|ない)",
+                local,
+            ):
+                continue
+            prefix, suffix = line[:success.start()], line[success.end():local_end]
+            japanese = None
+            for candidate in re.finditer(rf"(?i){recipient_list}\s*(?:へ|に)", prefix):
+                gap = prefix[candidate.end():]
+                if len(gap) <= 24 and not _BOT_CHAT_ROLE_RE.search(gap):
+                    japanese = candidate
+            english = re.search(rf"(?i)(?:\bto\b\s*|^\s*){recipient_list}\b", suffix)
+            roles_source = japanese.group(1) if japanese else (english.group(1) if english else "")
+            roles = [m.group(1).lower() for m in _BOT_CHAT_ROLE_RE.finditer(roles_source)]
+            ids = _BOT_CHAT_COORDINATION_RE.findall(line[success.start():local_end])
+            if roles and ids:
+                claimed.update((role, coordination_id) for role in roles for coordination_id in ids)
+            elif roles:
+                claimed.update((role, "") for role in roles)
+            elif ids:
+                claimed.update(("", coordination_id) for coordination_id in ids)
+    return claimed
+
+
+def _verified_bot_chat_deliveries(agent) -> tuple[set[tuple[str, str]], set[tuple[str, str]], bool]:
+    """Return sent/unknown recipient-ID pairs for this turn only."""
+    records = getattr(agent, "_turn_bot_chat_delivery_records", None)
+    if records is None:
+        return set(), set(), False
+    sent, unknown = set(), set()
+    for record in records:
+        args = record.get("args") if isinstance(record, dict) else None
+        if not isinstance(args, dict) or str(args.get("action", "")).lower() != "send":
+            continue
+        role = str(args.get("recipient_role", "")).lower()
+        if not _BOT_CHAT_ROLE_RE.fullmatch(role):
+            continue
+        coordination_id = str(args.get("coordination_id", ""))
+        try:
+            result = record.get("result")
+            payload = json.loads(result) if isinstance(result, str) else result
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        pair = (role, coordination_id)
+        if (
+            not record.get("is_error")
+            and isinstance(payload, dict) and payload.get("ok") is True
+            and payload.get("delivery") == "sent"
+        ):
+            sent.add(pair)
+        else:
+            unknown.add(pair)
+    return sent, unknown, True
+
+
+def _receipt_matches(claim: tuple[str, str], receipts: set[tuple[str, str]]) -> bool:
+    role, coordination_id = claim
+    return any(
+        (not role or role == receipt_role)
+        and (not coordination_id or coordination_id == receipt_id)
+        for receipt_role, receipt_id in receipts
+    )
+
+
+def _apply_bot_chat_delivery_gate(agent, final_response, logger):
+    """Correct bot-chat completion claims that lack a current-turn ``delivery=sent`` receipt."""
+    claimed = _claimed_bot_chat_deliveries(final_response)
+    if not claimed:
+        return final_response, False
+    try:
+        sent, unknown, available = _verified_bot_chat_deliveries(agent)
+        missing = {claim for claim in claimed if not _receipt_matches(claim, sent)}
+        if not missing:
+            return final_response, False
+        status = []
+        for role, coordination_id in sorted(claimed):
+            state = "送信確認" if _receipt_matches((role, coordination_id), sent) else (
+                "送信結果不明"
+                if _receipt_matches((role, coordination_id), unknown)
+                else "送信未確認"
+            )
+            if role:
+                status.append(f"{role.upper()}={state}")
+            if coordination_id:
+                status.append(f"話題ID={coordination_id}={state}")
+        reason = "証跡を取得できません" if not available else "対応する delivery=sent の受領証がありません"
+        correction = (
+            "⚠️ bot_chat証跡確認: 上記の送信完了表現を取り消します。"
+            f"{reason}。" + " / ".join(status)
+        )
+        return final_response.rstrip() + "\n\n" + correction, True
+    except Exception as exc:
+        logger.warning("bot-chat delivery evidence gate failed: %s", exc)
+        return (
+            final_response.rstrip()
+            + "\n\n⚠️ bot_chat証跡確認: 上記の送信完了表現を取り消します。証跡を確認できません。",
+            True,
+        )
+
+
 def _explain_abnormal_exit(agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger):
     """Turn-completion explainer: on abnormal exits, surface one explanation from
     ``_turn_exit_reason``. Only acts when no usable reply exists (empty, "(empty)",
@@ -398,12 +590,8 @@ def _last_turn_reasoning(messages) -> Optional[Any]:
     return None
 
 
-def _apply_output_hooks(
-    agent, final_response, logger, *, platform, effective_task_id, turn_id, original_user_message,
-    messages,
-) -> Tuple[Any, bool, Optional[Any]]:
-    """Fire ``transform_llm_output`` then ``post_llm_call`` once per turn after the tool loop.
-    Returns ``(final_response, transformed, pre_transform_response)``."""
+def _apply_output_transform(agent, final_response, logger, *, platform) -> Tuple[Any, bool, Optional[Any]]:
+    """Apply the first ``transform_llm_output`` result before evidence gates and persistence."""
     transformed, pre_transform = False, None
     # First hook to return a string wins; None/empty leaves the text unchanged.
     for _hook_result in _invoke_hook_safely(
@@ -416,6 +604,14 @@ def _apply_output_hooks(
         if isinstance(_hook_result, str) and _hook_result:
             pre_transform, final_response, transformed = final_response, _hook_result, True
             break
+    return final_response, transformed, pre_transform
+
+
+def _notify_post_llm_call(
+    agent, final_response, logger, *, platform, effective_task_id, turn_id,
+    original_user_message, messages,
+) -> None:
+    """Publish only the evidence-checked response to lifecycle consumers."""
     # Detached forks are internal work and must not publish turns under the parent's session ID.
     if not getattr(agent, "_persist_disabled", False):
         _invoke_hook_safely(
@@ -429,6 +625,25 @@ def _apply_output_hooks(
             model=agent.model,
             platform=platform,
         )
+
+
+def _apply_output_hooks(
+    agent, final_response, logger, *, platform, effective_task_id, turn_id, original_user_message,
+    messages,
+) -> Tuple[Any, bool, Optional[Any]]:
+    """Compatibility wrapper for callers that invoke both output hooks directly."""
+    final_response, transformed, pre_transform = _apply_output_transform(
+        agent, final_response, logger, platform=platform,
+    )
+    before_gate = final_response
+    final_response, gate_changed = _apply_bot_chat_delivery_gate(agent, final_response, logger)
+    if gate_changed:
+        pre_transform = pre_transform or before_gate
+        transformed = True
+    _notify_post_llm_call(
+        agent, final_response, logger, platform=platform, effective_task_id=effective_task_id,
+        turn_id=turn_id, original_user_message=original_user_message, messages=messages,
+    )
     return final_response, transformed, pre_transform
 
 
@@ -458,28 +673,47 @@ def finalize_turn(
 
     _rollback_interrupted_preflight_display(agent, interrupted)
 
+    _platform = getattr(agent, "platform", None) or ""
+    _response_transformed = False
+    _pre_transform_response = None
     _cleanup_errors: List[str] = []
-    # ``user_message`` may be a multimodal list of parts; the trajectory format wants a string.
-    _guarded_cleanup(
-        "save_trajectory",
-        lambda: agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed),
-        _cleanup_errors, logger,
-    )
     _guarded_cleanup(
         "cleanup_task_resources", lambda: agent._cleanup_task_resources(effective_task_id),
         _cleanup_errors, logger,
     )
-    # Persist only after the transcript tail is shaped and scaffolding removed. Each
-    # sub-step runs in the same order as the original inline block, and the
-    # stream-recovered ``final_response`` is rebound the moment it is computed — BEFORE
-    # the fallible tail-shaping / override / micro-compaction / persist calls — so a
-    # raise in any of them can't drop text the user already saw (#95514, #8049).
-    def _persist_step():
-        nonlocal final_response
-        _drop_transcript_scaffolding(agent, messages)
-        final_response, _recovered_from_stream = _recover_final_from_stream(
-            agent, final_response, interrupted, failed
+    final_response, _recovered_from_stream = _recover_final_from_stream(
+        agent, final_response, interrupted, failed
+    )
+    _transcript_response = final_response
+    if final_response and not interrupted:
+        final_response = _append_file_mutation_footer(agent, final_response, logger)
+    if not interrupted:
+        final_response = _explain_abnormal_exit(
+            agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
         )
+    if final_response and not interrupted:
+        final_response, _response_transformed, _pre_transform_response = _apply_output_transform(
+            agent, final_response, logger, platform=_platform,
+        )
+    if final_response:
+        _before_gate = final_response
+        final_response, _gate_changed = _apply_bot_chat_delivery_gate(agent, final_response, logger)
+        if _gate_changed:
+            _pre_transform_response = _pre_transform_response or _before_gate
+            _response_transformed = True
+
+    # Synchronize before any fallible transcript shaping so returned/live/hook history
+    # cannot retain the unverified text when persistence cleanup fails.
+    _guarded_cleanup(
+        "sync_final_response",
+        lambda: _sync_transcript_final_response(agent, messages, _transcript_response, final_response),
+        _cleanup_errors,
+        logger,
+    )
+
+    # Persistence failures must not bypass the user-visible evidence gate above.
+    def _persist_step():
+        _drop_transcript_scaffolding(agent, messages)
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger)
@@ -492,23 +726,20 @@ def finalize_turn(
     with suppress(Exception):
         agent._session_messages = messages
 
+    # ``user_message`` may be a multimodal list of parts; the trajectory format wants a string.
+    _guarded_cleanup(
+        "save_trajectory",
+        lambda: agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed),
+        _cleanup_errors, logger,
+    )
+
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger)
 
-    # Response transforms apply only to real, uninterrupted responses.
     if final_response and not interrupted:
-        final_response = _append_file_mutation_footer(agent, final_response, logger)
-    if not interrupted:
-        final_response = _explain_abnormal_exit(
-            agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
-        )
-
-    _platform = getattr(agent, "platform", None) or ""
-    _response_transformed = False
-    _pre_transform_response = None
-    if final_response and not interrupted:
-        final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
-            agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
-            turn_id=turn_id, original_user_message=original_user_message, messages=messages,
+        _notify_post_llm_call(
+            agent, final_response, logger, platform=_platform,
+            effective_task_id=effective_task_id, turn_id=turn_id,
+            original_user_message=original_user_message, messages=messages,
         )
 
     # Context engine observation hook: the turn finished with the finalized transcript.

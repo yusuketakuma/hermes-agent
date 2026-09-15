@@ -49,10 +49,15 @@ def _run(job, adapters):
         standalone.append(chat_id)
         return {"success": False, "error": "DISCORD_BOT_TOKEN is not set"}
 
+    target_chat_id = job["deliver"].split(":", 2)[1]
+    discord_config = {"discord": {"server_targets": [{
+        "guild_id": "G1", "channel_ids": [target_chat_id]
+    }]}}
     config = MagicMock()
     config.platforms = {Platform.DISCORD: PlatformConfig(enabled=True)}
     config.get_home_channel = lambda p: None
     with patch("gateway.config.load_gateway_config", return_value=config), \
+         patch("hermes_cli.config.load_config", return_value=discord_config), \
          patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
          patch("tools.send_message_tool._send_to_platform", _fake_send_to_platform), \
          patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):

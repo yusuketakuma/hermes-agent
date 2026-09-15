@@ -954,14 +954,22 @@ class TurnRunner:
         agent = evicted[0] if isinstance(evicted, tuple) and evicted else None
         return agent if agent and agent is not _AGENT_PENDING_SENTINEL else None
 
-    def _lookup_cached_agent(self, sig, cache_lock, cache, max_iterations, peek_sid, dead, msg_count):
+    def _lookup_cached_agent(
+        self, sig, cache_lock, cache, max_iterations, peek_sid, dead, msg_count, *, allow_reuse: bool = True,
+    ):
         ctx = self._ctx
         out = self._CachedAgentLookup()
         if not (cache_lock and cache is not None):
             return out
         with cache_lock:
             cached = cache.get(ctx.session_key)
-            if not (cached and cached[1] == sig):
+            if not cached:
+                return out
+            if not allow_reuse:
+                out.evicted = self._pop_cached_agent_for_eviction()
+                return out
+            if cached[1] != sig:
+                out.evicted = self._pop_cached_agent_for_eviction()
                 return out
             # cached[2] = message_count at cache time (stale when a second process appended rows);
             # cached[3] = the session_id the snapshot was taken for.
@@ -1032,7 +1040,10 @@ class TurnRunner:
             session_db=getattr(runner._session_db, "_db", runner._session_db),
             # Reload from disk — do not reuse the startup snapshot.
             # See #60955.
-            fallback_model=self._runner._refresh_fallback_model(),
+            fallback_model=(
+                None if turn_route.get("allow_fallback") is False
+                else self._runner._refresh_fallback_model()
+            ),
             skip_context_files=skip_context_files,
             # Keep the persona even with minimal context: soul identity is one small file.
             load_soul_identity=True,
@@ -1055,12 +1066,15 @@ class TurnRunner:
         cache = getattr(runner, "_agent_cache", None)
         peek_sid, dead = self._cached_sid_is_dead(cache_lock, cache)
         msg_count = self._current_message_count()
-        found = self._lookup_cached_agent(sig, cache_lock, cache, max_iterations, peek_sid, dead, msg_count)
+        found = self._lookup_cached_agent(
+            sig, cache_lock, cache, max_iterations, peek_sid, dead, msg_count,
+            allow_reuse=turn_route.get("allow_fallback", True) is not False,
+        )
         agent = found.agent
         # Lock released — refresh the reused agent's fallback chain from disk OUTSIDE the cache lock
         # (disk I/O under the lock stalls the idle-sweep watcher and Discord heartbeats). A chain
         # configured after caching must reach the next turn; per-session serialization keeps it safe.
-        if found.reused and agent is not None:
+        if found.reused and agent is not None and turn_route.get("allow_fallback", True):
             self._runner._apply_fallback_chain_to_agent(agent, runner._refresh_fallback_model())
         if found.evicted is not None:
             self._release_evicted_agent(found.evicted)
@@ -1167,6 +1181,9 @@ class TurnRunner:
         agent.notice_clear_callback = None  # sends can't be retracted
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config, agent.service_tier = reasoning_config, runner._service_tier
+        agent._gateway_turn_policy = (
+            dict(ctx.turn_policy) if isinstance(ctx.turn_policy, dict) else None
+        )
         self._merge_turn_request_overrides(agent, turn_route)
         # Must-deliver notes for THIS turn ride the current user message (api_content sidecar), never
         # the system prompt. Assigned unconditionally so a reused agent never replays a stale note.
@@ -1645,7 +1662,8 @@ class TurnRunner:
                 ):
                     self._restore_telegram_thread_id_after_split(agent_session_id)
                 runner._sync_telegram_topic_binding(src, entry, reason="agent-run-compression")
-        runner._sync_session_model_from_agent(agent_session_id, agent)
+        if not (isinstance(ctx.turn_policy, dict) and ctx.turn_policy.get("persist_model") is False):
+            runner._sync_session_model_from_agent(agent_session_id, agent)
         # history_offset=0 whenever the agent's message list lost the original history prefix
         # (split OR in-place compaction): the returned `messages` is the compacted set, persist all
         # of it; slicing past the pre-compaction length would drop everything.
@@ -1721,25 +1739,48 @@ class TurnRunner:
         platform_key = "cli" if ctx.source.platform == Platform.LOCAL else ctx.source.platform.value
         combined_ephemeral = self._combined_ephemeral_prompt()
         max_iterations = _current_max_iterations()
-        try:
-            model, runtime_kwargs = runner._resolve_session_agent_runtime(
-                source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
-            )
-            logger.debug(
-                "run_agent resolved: model=%s provider=%s session=%s",
-                model, runtime_kwargs.get("provider"), ctx.session_key or "",
-            )
-        except Exception as exc:
-            return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": []}
+        local_turn_policy = (
+            ctx.turn_policy
+            if isinstance(ctx.turn_policy, dict) and ctx.turn_policy.get("route") == "local"
+            else None
+        )
+        if local_turn_policy is not None:
+            model, runtime_kwargs = str(local_turn_policy.get("model") or ""), {}
+        else:
+            try:
+                model, runtime_kwargs = runner._resolve_session_agent_runtime(
+                    source=ctx.source, session_key=ctx.session_key, user_config=ctx.user_config,
+                )
+                logger.debug(
+                    "run_agent resolved: model=%s provider=%s session=%s",
+                    model, runtime_kwargs.get("provider"), ctx.session_key or "",
+                )
+            except Exception as exc:
+                return {"final_response": f"⚠️ Provider authentication failed: {exc}", "messages": [], "api_calls": 0, "tools": []}
         pr = runner._provider_routing
         reasoning_config = runner._resolve_session_reasoning_config(source=ctx.source, session_key=ctx.session_key, model=model)
         runner._reasoning_config = reasoning_config
         runner._service_tier = runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key)
         stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
-        turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
-        agent, reused_cached_agent = self._resolve_turn_agent(
-            turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
-        )
+        try:
+            if local_turn_policy is not None:
+                turn_route = runner._resolve_turn_agent_config(
+                    ctx.message, model, runtime_kwargs, turn_policy=local_turn_policy,
+                )
+            else:
+                turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+            agent, reused_cached_agent = self._resolve_turn_agent(
+                turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
+            )
+        except Exception as exc:
+            if local_turn_policy is not None:
+                logger.warning("Local turn route unavailable; refusing paid fallback: %s", exc)
+                return {
+                    "final_response": "⚠️ 雑談用のローカルLLMを利用できないため、この会話は停止しました。",
+                    "messages": [], "api_calls": 0, "tools": [], "failed": True,
+                    "failure_reason": "local_route_unavailable", "error": "local route unavailable",
+                }
+            raise
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
         agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
         persist_msg, persist_ts = self._prepare_turn_message(agent_history)

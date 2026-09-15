@@ -151,6 +151,52 @@ def _authorize_relay_target(platform_name: str, chat_id, thread_id=None, *,
         )
 
 
+def _discord_bot_conversation_channel_id(config) -> str | None:
+    """Return the configured bot-lounge channel, if it is valid."""
+    try:
+        from gateway.config import Platform
+
+        platform_config = (getattr(config, "platforms", {}) or {}).get(Platform.DISCORD)
+        extra = getattr(platform_config, "extra", {}) or {}
+        settings = extra.get("bot_conversation") if isinstance(extra, dict) else None
+        channel_id = settings.get("channel_id") if isinstance(settings, dict) else None
+        channel_id = str(channel_id or "").strip()
+        return channel_id if channel_id.isdigit() else None
+    except Exception:
+        logger.exception("Discord bot-conversation configuration could not be read")
+        return None
+
+
+def _authorize_discord_channel_target(
+    chat_id, thread_id=None, *, internal_bot_conversation=False, configured_channel_id=None,
+) -> str | None:
+    """Enforce the exact Discord allowlist; internal bot-chat is pinned to its own channel."""
+    target_id = str(thread_id or chat_id or "").strip()
+    if not target_id:
+        return "Refusing to send to Discord: the destination channel is missing."
+    if internal_bot_conversation and (
+        thread_id or not configured_channel_id or str(chat_id or "").strip() != configured_channel_id
+    ):
+        return "Refusing internal bot conversation: only the configured bot-lounge text channel is allowed."
+    try:
+        from tools.discord_tool import _load_allowed_targets_config, _target_allowed
+
+        targets = _load_allowed_targets_config()
+        allowed = _target_allowed("fetch_messages", {"channel_id": target_id}, targets)
+    except Exception:  # noqa: BLE001 - an authorization fault must deny the send
+        logger.exception("Discord target authorization failed — refusing the send")
+        return (
+            "Refusing to send to Discord: the target authorization policy could not "
+            "be loaded, so this destination could not be verified."
+        )
+    if not allowed:
+        return (
+            f"Refusing to send to Discord target '{target_id}': configure an exact "
+            "matching channel_id in discord.server_targets."
+        )
+    return None
+
+
 def _handle_react(args, remove=False):
     """Attach (``remove=True``: retract) an emoji reaction via the live gateway adapter; no
     standalone fallback because reacting needs the adapter's live message-id state."""
@@ -174,6 +220,10 @@ def _handle_react(args, remove=False):
         except Exception:
             return tool_error(f"No chat specified and no home channel set for {platform_name}. "
                               f"Use '{platform_name}:chat_id'.")
+    if platform_name == "discord":
+        _discord_denial = _authorize_discord_channel_target(chat_id, _thread_id)
+        if _discord_denial:
+            return tool_error(_discord_denial)
     # P5(a): same egress-authorization floor as the send path — a reaction is
     # an outbound act against a named destination, so an unattested relay
     # target must be refused here too, not just on `send`.
@@ -217,6 +267,7 @@ def _handle_send(args):
     platform, pconfig, entry, err = _resolve_platform_config(platform_name, config)
     if err:
         return tool_error(err)
+    internal_bot_conversation = bool(args.get("internal_bot_conversation"))
     from gateway.platforms.base import BasePlatformAdapter
     # Capture [[as_document]] before extract_media strips it (images keep original bytes via send_document).
     force_document_attachments = "[[as_document]]" in message
@@ -237,6 +288,17 @@ def _handle_send(args):
         chat_id, resolve_err = _slack_dm_chat_id(pconfig, chat_id)
         if resolve_err:
             return json.dumps(resolve_err)
+    if platform_name == "discord":
+        if internal_bot_conversation:
+            _discord_denial = _authorize_discord_channel_target(
+                chat_id, thread_id,
+                internal_bot_conversation=True,
+                configured_channel_id=_discord_bot_conversation_channel_id(config),
+            )
+        else:
+            _discord_denial = _authorize_discord_channel_target(chat_id, thread_id)
+        if _discord_denial:
+            return tool_error(_discord_denial)
     # POSITION IS LOAD-BEARING — this must stay BELOW Slack user→DM resolution.
     # `_parse_target_ref` emits internal pseudo-ids (`user_name:ben`,
     # `user:U...`) that no provenance can ever contain, because provenances
@@ -258,6 +320,7 @@ def _handle_send(args):
         handler_args = {"args": args} if entry is not None and entry.send_message_handler is not None else {}
         result = _run_async(_send_to_platform(platform, pconfig, chat_id, cleaned_message, thread_id=thread_id,
                                               media_files=media_files, force_document=force_document_attachments,
+                                              internal_bot_conversation=internal_bot_conversation,
                                               **handler_args))
         if isinstance(result, dict) and result.get("success"):
             if used_home_channel:
@@ -537,7 +600,7 @@ _PLUGIN_STANDALONE_MEDIA = {"discord": ("Discord", False, True, [], False), "fei
 
 
 async def _send_plugin_standalone(platform_name, pconfig, chat_id, message, chunks, media_files, *, thread_id,
-                                  max_len, force_document):
+                                  max_len, force_document, internal_bot_conversation=False):
     """Chunked send through a plugin's standalone_sender_fn; one captionable file + short text
     rides as the media caption."""
     label, discover, captionable, empty_media, pass_force = _PLUGIN_STANDALONE_MEDIA[platform_name]
@@ -545,6 +608,8 @@ async def _send_plugin_standalone(platform_name, pconfig, chat_id, message, chun
     if err:
         return err
     extra = {"force_document": force_document} if pass_force else {}
+    if internal_bot_conversation:
+        extra["internal_bot_conversation"] = True
     if captionable:
         # Cap on the platform's own message limit so the caption is deliverable.
         caption, _ = _media_caption_split(message, media_files, max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT))
@@ -587,7 +652,8 @@ _TEXT_SENDERS = {
 _MEDIA_PLATFORMS_NOTE = "telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, args=None):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None,
+                            force_document=False, args=None, internal_bot_conversation=False):
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:
     Weixin first (its native helper must not be blocked by unrelated optional imports such as
     lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text."""
@@ -606,7 +672,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     chunks = BasePlatformAdapter.truncate_message(message, max_len) if max_len else [message]
     if platform_name == "discord" or (media_files and platform_name in _PLUGIN_STANDALONE_MEDIA):
         return await _send_plugin_standalone(platform_name, pconfig, chat_id, message, chunks, media_files,
-                                             thread_id=thread_id, max_len=max_len, force_document=force_document)
+                                             thread_id=thread_id, max_len=max_len, force_document=force_document,
+                                             internal_bot_conversation=internal_bot_conversation)
     route = _CHUNKED_ROUTES.get(platform_name)
     if route is not None and (media_files or not route[0]):
         _, empty_media, sender = route

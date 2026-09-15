@@ -268,12 +268,10 @@ def _exited_status(code: int) -> int:
 
 
 
-def test_rate_limit_exit_requeues_without_counting_failure(
+def test_rate_limit_exit_uses_the_failure_budget(
     kanban_home, monkeypatch,
 ):
-    """A rate-limit sentinel exit releases the task to ``ready`` and leaves
-    ``consecutive_failures`` untouched — the breaker must never trip on a
-    transient throttle, even across many quota-wall hits."""
+    """A rate-limit sentinel exit is retryable, but cannot loop forever."""
     import hermes_cli.kanban_db as _kb
     from hermes_cli import kanban_db_dispatch as _kbd
 
@@ -284,18 +282,17 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         host = _kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="rl", assignee="a")
 
-        # Simulate FAR more quota-wall hits than DEFAULT_FAILURE_LIMIT (2).
-        # If any of these counted as a failure the task would be blocked.
-        for i in range(6):
+        # The first quota-wall hit is retryable; the second reaches the
+        # shared default breaker and parks the task.
+        for i in range(2):
             pid = 70000 + i
             # Claim to open a real run (so detect_crashed_workers can close
             # it with a rate_limited outcome), then point the claim at this
             # host + a dead pid so the crash path acts on it.
             kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
             conn.execute(
-                "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
-                "WHERE id=?",
-                (pid, 0, tid),
+                "UPDATE tasks SET worker_pid=? WHERE id=?",
+                (pid, tid),
             )
             conn.commit()
             _kbd._record_worker_exit(
@@ -309,13 +306,11 @@ def test_rate_limit_exit_requeues_without_counting_failure(
             assert tid in rl
 
             task = kb.get_task(conn, tid)
-            assert task.status == "ready", (
-                f"hit {i}: should requeue ready, got {task.status}"
+            expected_status = "ready" if i == 0 else "blocked"
+            assert task.status == expected_status, (
+                f"hit {i}: expected {expected_status}, got {task.status}"
             )
-            assert task.consecutive_failures == 0, (
-                f"hit {i}: rate-limit must not count a failure, "
-                f"got {task.consecutive_failures}"
-            )
+            assert task.consecutive_failures == i + 1
 
         # Last failure error stamped so the respawn guard recognizes the
         # quota wall.
@@ -331,6 +326,38 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         assert "crashed" not in outcomes
 
 
+
+
+def test_missing_exit_record_quarantines_instead_of_replaying(
+    kanban_home, monkeypatch,
+):
+    """A dead PID without a trustworthy reap record must not replay work."""
+    import hermes_cli.kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as _kbd
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kbc.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="unknown result", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:worker")
+        pid = 79999
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        _kbd._recent_worker_exits.pop(pid, None)
+
+        assert _kbd.detect_crashed_workers(conn) == []
+        assert tid in getattr(_kbd.detect_crashed_workers, "_last_result_unknown", [])
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert kb.recompute_ready(conn) == 0
+        assert kb.latest_run(conn, tid).outcome == "result_unknown"
+        assert any(e.kind == "result_unknown" for e in kb.list_events(conn, tid))
+
+        # Only an explicit operator unblock clears the quarantine.
+        assert kb.unblock_task(conn, tid) is True
+        assert kb.get_task(conn, tid).status == "ready"
 
 
 def test_respawn_guard_defers_rate_limited_within_cooldown(

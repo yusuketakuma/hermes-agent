@@ -1628,6 +1628,14 @@ def _prepare_target_delivery(
         # never seeds). Stay AFTER mirror_this_target/origin_user_id (need ORIGINAL thread_id).
         thread_id = None
 
+    if platform_name.lower() == "discord":
+        from tools.send_message_tool import _authorize_discord_channel_target
+
+        discord_denial = _authorize_discord_channel_target(chat_id, thread_id)
+        if discord_denial:
+            _note_target_error(job, discord_denial, delivery_errors)
+            return None
+
     # Thread-preferred continuable cron: open a DEDICATED thread; its session is seeded after a
     # successful send. DM-only platforms return None → mirror the origin DM. in_channel SKIPS
     # this: it posts flat and _seed_cron_channel_session CREATES the session.

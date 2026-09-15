@@ -12,12 +12,16 @@ from tools.discord_tool import (
     _ACTIONS,
     _ADMIN_ACTIONS,
     _CORE_ACTIONS,
+    _CHANNEL_TARGET_ACTIONS,
+    _GUILD_TARGET_ACTIONS,
+    _MUTATING_ACTIONS,
     _available_actions,
     _channel_type_name,
     _detect_capabilities,
     _discord_request,
     _get_bot_token,
     _load_allowed_actions_config,
+    _load_allowed_targets_config,
     _reset_capability_cache,
     check_discord_tool_requirements,
     discord_admin_handler,
@@ -181,6 +185,10 @@ class TestDiscordServerValidation:
 
     def test_missing_multiple_params(self, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {"server_actions": "add_role"}},
+        )
         result = json.loads(discord_admin_handler(action="add_role"))
         assert "error" in result
         assert "guild_id" in result["error"]
@@ -196,6 +204,12 @@ class TestListChannels:
     @patch("tools.discord_tool._discord_request")
     def test_list_channels_organized(self, mock_req, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {
+                "server_targets": [{"guild_id": "111", "channel_ids": ["11"]}],
+            }},
+        )
         mock_req.return_value = [
             {"id": "10", "name": "General", "type": 4, "position": 0, "parent_id": None},
             {"id": "11", "name": "chat", "type": 0, "position": 0, "parent_id": "10", "topic": "Main chat", "nsfw": False},
@@ -222,6 +236,12 @@ class TestListRoles:
     @patch("tools.discord_tool._discord_request")
     def test_list_roles_sorted(self, mock_req, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {
+                "server_targets": [{"guild_id": "111", "channel_ids": ["11"]}],
+            }},
+        )
         mock_req.return_value = [
             {"id": "1", "name": "@everyone", "position": 0, "color": 0, "mentionable": False, "managed": False, "hoist": False},
             {"id": "2", "name": "Admin", "position": 2, "color": 16711680, "mentionable": True, "managed": False, "hoist": True},
@@ -244,6 +264,12 @@ class TestSearchMembers:
     @patch("tools.discord_tool._discord_request")
     def test_search_members_limit_capped(self, mock_req, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {
+                "server_targets": [{"guild_id": "111", "channel_ids": ["11"]}],
+            }},
+        )
         mock_req.return_value = []
         discord_core(action="search_members", guild_id="111", query="x", limit=200)
         call_params = mock_req.call_args[1]["params"]
@@ -258,6 +284,12 @@ class TestFetchMessages:
     @patch("tools.discord_tool._discord_request")
     def test_fetch_messages(self, mock_req, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {
+                "server_targets": [{"guild_id": "111", "channel_ids": ["11"]}],
+            }},
+        )
         mock_req.return_value = [
             {
                 "id": "1001",
@@ -283,6 +315,13 @@ class TestCreateThread:
     @patch("tools.discord_tool._discord_request")
     def test_create_standalone_thread(self, mock_req, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {
+                "server_actions": "create_thread",
+                "server_targets": [{"guild_id": "111", "channel_ids": ["11"]}],
+            }},
+        )
         mock_req.return_value = {"id": "800", "name": "New Thread"}
         result = json.loads(discord_core(action="create_thread", channel_id="11", name="New Thread"))
         assert result["success"] is True
@@ -296,6 +335,13 @@ class TestCreateThread:
     @patch("tools.discord_tool._discord_request")
     def test_create_thread_from_message(self, mock_req, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {
+                "server_actions": "create_thread",
+                "server_targets": [{"guild_id": "111", "channel_ids": ["11"]}],
+            }},
+        )
         mock_req.return_value = {"id": "801", "name": "Discussion"}
         result = json.loads(discord_core(
             action="create_thread", channel_id="11", name="Discussion", message_id="1001",
@@ -323,6 +369,12 @@ class TestErrorHandling:
     @patch("tools.discord_tool._discord_request")
     def test_unexpected_error_handled_core(self, mock_req, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {
+                "server_targets": [{"guild_id": "111", "channel_ids": ["11"]}],
+            }},
+        )
         mock_req.side_effect = RuntimeError("something broke")
         result = json.loads(discord_core(action="fetch_messages", channel_id="11"))
         assert "error" in result
@@ -347,6 +399,12 @@ class TestRegistration:
         """Core + admin actions should cover all known actions."""
         assert set(_CORE_ACTIONS.keys()) | set(_ADMIN_ACTIONS.keys()) == set(_ACTIONS.keys())
         assert set(_CORE_ACTIONS.keys()) & set(_ADMIN_ACTIONS.keys()) == set()
+
+    def test_target_guard_covers_every_addressed_action(self):
+        assert (
+            _GUILD_TARGET_ACTIONS | _CHANNEL_TARGET_ACTIONS | {"list_guilds"}
+        ) == set(_ACTIONS)
+        assert not (_GUILD_TARGET_ACTIONS & _CHANNEL_TARGET_ACTIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -456,7 +514,10 @@ class TestNonBlockingCapabilityDetection:
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
-            lambda: {"discord": {"server_actions": ""}},
+            lambda: {"discord": {
+                "server_actions": "",
+                "server_targets": [{"guild_id": "111", "channel_ids": ["11"]}],
+            }},
         )
         with patch("tools.discord_tool._load_caps_from_disk", return_value=None), \
              patch("tools.discord_tool.threading.Thread") as mock_thread, \
@@ -468,7 +529,7 @@ class TestNonBlockingCapabilityDetection:
         assert mock_thread.call_count == 1
         assert schema is not None
         actions = set(schema["parameters"]["properties"]["action"]["enum"])
-        assert actions == set(_CORE_ACTIONS.keys())  # permissive default
+        assert actions == set(_CORE_ACTIONS.keys()) - _MUTATING_ACTIONS
 
     @patch("tools.discord_tool._discord_request")
     def test_cache_is_keyed_by_token(self, mock_req):
@@ -531,10 +592,13 @@ class TestConfigAllowlist:
             _logging.getLogger("tools.discord_tool").setLevel(_prev_dt)
 
     def test_empty_string_returns_none(self, monkeypatch):
-        """Empty config means no allowlist — all actions visible."""
+        """Empty config means no mutating action is enabled."""
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
-            lambda: {"discord": {"server_actions": ""}},
+            lambda: {"discord": {
+                "server_actions": "",
+                "server_targets": [{"guild_id": "111", "channel_ids": ["11"]}],
+            }},
         )
         assert _load_allowed_actions_config() is None
 
@@ -548,11 +612,30 @@ class TestConfigAllowlist:
 
 
     def test_config_load_failure_is_permissive(self, monkeypatch):
-        """If config can't be loaded at all, fall back to None (all allowed)."""
+        """If config can't be loaded, fail closed for mutating actions."""
         def bad_load():
             raise RuntimeError("disk gone")
         monkeypatch.setattr("hermes_cli.config.load_config", bad_load)
         assert _load_allowed_actions_config() is None
+
+    def test_targets_are_unset_by_default(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {"server_actions": "create_thread"}},
+        )
+        assert _load_allowed_targets_config() is None
+
+    def test_targets_normalize_valid_entries_and_drop_malformed(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {"server_targets": [
+                {"guild_id": " 111 ", "channel_ids": [" 11 "]},
+                {"guild_id": "", "channel_ids": ["12"]},
+            ]}},
+        )
+        assert _load_allowed_targets_config() == [
+            {"guild_id": "111", "channel_ids": ["11"]},
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -560,9 +643,13 @@ class TestConfigAllowlist:
 # ---------------------------------------------------------------------------
 
 class TestAvailableActions:
-    def test_all_available_when_unrestricted(self):
+    def test_mutations_hidden_without_explicit_allowlist(self):
         caps = {"detected": True, "has_members_intent": True, "has_message_content": True}
-        assert _available_actions(caps, None) == list(_ACTIONS.keys())
+        actions = _available_actions(caps, None)
+        assert set(actions) == set(_ACTIONS) - {
+            "create_thread", "pin_message", "unpin_message", "delete_message",
+            "add_role", "remove_role",
+        }
 
     def test_no_members_intent_hides_member_actions(self):
         caps = {"detected": True, "has_members_intent": False, "has_message_content": True}
@@ -609,7 +696,10 @@ class TestDynamicSchema:
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
-            lambda: {"discord": {"server_actions": ""}},
+            lambda: {"discord": {
+                "server_actions": "",
+                "server_targets": [{"guild_id": "111", "channel_ids": ["11"]}],
+            }},
         )
         mock_req.return_value = {"flags": 1 << 18}  # only MESSAGE_CONTENT
         # Warm the capability cache — schema builds are non-blocking and use
@@ -625,12 +715,31 @@ class TestDynamicSchema:
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
-            lambda: {"discord": {"server_actions": "list_guilds,list_channels"}},
+            lambda: {"discord": {
+                "server_actions": "list_guilds,list_channels",
+                "server_targets": [{"guild_id": "111", "channel_ids": ["11"]}],
+            }},
         )
         mock_req.return_value = {"flags": (1 << 14) | (1 << 18)}
         schema = get_dynamic_schema_admin()
         actions = schema["parameters"]["properties"]["action"]["enum"]
         assert actions == ["list_guilds", "list_channels"]
+
+    @patch("tools.discord_tool._load_caps_from_disk", return_value={
+        "has_members_intent": True, "has_message_content": True, "detected": True,
+    })
+    @patch("tools.discord_tool._discord_request")
+    def test_schema_hides_addressed_actions_without_targets(
+        self, mock_req, _mock_caps, monkeypatch,
+    ):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {"server_actions": "list_guilds,server_info"}},
+        )
+        schema = get_dynamic_schema_admin()
+        assert schema["parameters"]["properties"]["action"]["enum"] == ["list_guilds"]
+        mock_req.assert_not_called()
 
     @patch("tools.discord_tool._discord_request")
     def test_empty_allowlist_with_valid_values_hides_tools(self, mock_req, monkeypatch):
@@ -674,6 +783,49 @@ class TestRuntimeAllowlistEnforcement:
         result = json.loads(discord_admin_handler(action="list_guilds"))
         assert "guilds" in result
 
+    @patch("tools.discord_tool._discord_request")
+    def test_target_is_required_for_addressed_action(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {"server_actions": "create_thread"}},
+        )
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="11", name="blocked",
+        ))
+        assert "outside discord.server_targets" in result["error"]
+        mock_req.assert_not_called()
+
+    @patch("tools.discord_tool._discord_request")
+    def test_channel_target_mismatch_never_egresses(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {
+                "server_actions": "create_thread",
+                "server_targets": [{"guild_id": "111", "channel_ids": ["11"]}],
+            }},
+        )
+        result = json.loads(discord_core(
+            action="create_thread", channel_id="99", name="blocked",
+        ))
+        assert "outside discord.server_targets" in result["error"]
+        mock_req.assert_not_called()
+
+    @patch("tools.discord_tool._discord_request")
+    def test_guild_target_allows_guild_action(self, mock_req, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {
+                "server_targets": [{"guild_id": "111", "channel_ids": []}],
+            }},
+        )
+        mock_req.return_value = {"id": "111", "name": "guild", "features": []}
+        result = json.loads(discord_admin_handler(action="server_info", guild_id="111"))
+        assert result["id"] == "111"
+        mock_req.assert_called_once()
+
 
 # ---------------------------------------------------------------------------
 # 403 enrichment
@@ -685,7 +837,10 @@ class Test403Enrichment:
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
-            lambda: {"discord": {"server_actions": ""}},
+            lambda: {"discord": {
+                "server_actions": "add_role",
+                "server_targets": [{"guild_id": "1", "channel_ids": []}],
+            }},
         )
         mock_req.side_effect = DiscordAPIError(403, '{"message":"Missing Permissions"}')
         result = json.loads(discord_admin_handler(
@@ -736,7 +891,10 @@ class TestModelToolsIntegration:
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
         monkeypatch.setattr(
             "hermes_cli.config.load_config",
-            lambda: {"discord": {"server_actions": "list_guilds,server_info"}},
+            lambda: {"discord": {
+                "server_actions": "list_guilds,server_info",
+                "server_targets": [{"guild_id": "111", "channel_ids": []}],
+            }},
         )
         # Bot without GUILD_MEMBERS intent
         mock_req.return_value = {"flags": 0}

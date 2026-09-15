@@ -159,7 +159,8 @@ class TestRelayDeliveryGate:
         config = MagicMock()
         config.platforms = {}  # neither discord nor relay configured natively
         config.get_home_channel = lambda p: None
-        result = self._run({Platform.RELAY: self._relay_adapter()}, config)
+        with patch("tools.send_message_tool._authorize_discord_channel_target", return_value=None):
+            result = self._run({Platform.RELAY: self._relay_adapter()}, config)
         assert result is None  # None == delivered without errors
 
     def test_native_gate_preserved_without_relay(self, monkeypatch):

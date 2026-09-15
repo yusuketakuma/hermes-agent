@@ -1453,11 +1453,14 @@ DEFAULT_CONFIG = {
         # holding the allowed role. Unset / "" / 0 = off.
         # See #12136.
         "dm_role_auth_guild": "",
-        # discord / discord_admin tools: allowed actions (comma string or YAML list; empty = all,
+        # discord / discord_admin tools: allowed actions (comma string or YAML list; empty = read-only,
         # subject to bot intents; unknown names dropped with a warning): list_guilds, server_info,
         # list_channels, channel_info, list_roles, member_info, search_members, fetch_messages,
         # list_pins, pin_message, unpin_message, create_thread, add_role, remove_role.
         "server_actions": "",
+        # Exact targets for Discord REST actions and outbound send_message/cron delivery. Each entry is
+        # {guild_id: "...", channel_ids: ["..."]}; empty channel_ids permits only guild actions.
+        "server_targets": [],
         # DEPRECATED no-op (uploads are always cached; messaging auth is the gate). Kept so existing
         # configs don't error. Env: DISCORD_ALLOW_ANY_ATTACHMENT.
         "allow_any_attachment": False,

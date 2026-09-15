@@ -33,6 +33,18 @@ logger = logging.getLogger("gateway.run")
 class GatewayBusySessionMixin:
     """Busy-session queueing, slot claims, slash dispatch tables, destructive-slash confirmation."""
 
+    @staticmethod
+    def _busy_turn_policy(event: "MessageEvent") -> Optional[dict]:
+        metadata = getattr(event, "metadata", None)
+        policy = metadata.get("turn_policy") if isinstance(metadata, dict) else None
+        return policy if isinstance(policy, dict) else None
+
+    def _busy_turn_policy_matches(self, event: "MessageEvent", running_agent: Any) -> bool:
+        """Do not inject a follow-up into an agent running under a different route policy."""
+        agent_state = getattr(running_agent, "__dict__", None)
+        current_policy = agent_state.get("_gateway_turn_policy") if isinstance(agent_state, dict) else None
+        return self._busy_turn_policy(event) == current_policy
+
     def _queue_during_drain_enabled(self, busy_input_mode: Optional[str] = None) -> bool:
         # "queue"/"steer" mean messages survive a restart (queued for the new process); "interrupt" drops.
         mode = busy_input_mode or self._busy_input_mode
@@ -275,7 +287,7 @@ class GatewayBusySessionMixin:
     # Metadata that must match for two pending events to merge into one slot.
     _SECURITY_METADATA_KEYS = (
         "hermes_plugin_id", "hermes_plugin_injection", "gateway_session_key",
-        "gateway_session_id", "gateway_session_strict",
+        "gateway_session_id", "gateway_session_strict", "turn_policy",
     )
 
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
@@ -477,6 +489,19 @@ class GatewayBusySessionMixin:
     ) -> "GatewayRunner._BusySteerOutcome":
         """Apply interrupt->queue demotions, then attempt steer (steer mode) or redirect (interrupt mode)."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        if (
+            running_agent is not None
+            and running_agent is not _AGENT_PENDING_SENTINEL
+            and not self._busy_turn_policy_matches(event, running_agent)
+        ):
+            logger.info(
+                "Queueing busy follow-up for %s because its turn policy differs from the running turn",
+                session_key,
+            )
+            return self._BusySteerOutcome(
+                effective_mode="queue", demoted_for_subagents=False,
+                demoted_for_compression=False, steered=False, redirected=False,
+            )
         # Steer injects mid-run via running_agent.steer(), falling back to queue (nothing lost) when
         # the agent isn't running yet, lacks steer(), or the payload is empty. Interrupt is demoted
         # to queue while subagents run (interrupt() would abort them); /stop and /new still cancel all.
@@ -661,6 +686,13 @@ class GatewayBusySessionMixin:
                 self._queue_or_replace_pending_event(session_key, event)
                 return True
             return False  # base adapter queues silently behind the active turn
+
+        # Busy callbacks enter directly from adapters and do not pass through _hm_admit_event.
+        # Classify the event here before steer/redirect/queue can select the wrong model.
+        if not getattr(event, "_gateway_dispatch_classified", False):
+            event = self._hm_pre_gateway_dispatch_hook(event, event.source)
+            if event is None:
+                return True
 
         # Same authorization gate as the cold path, else unauthorized users in shared threads
         # inject messages into a session they don't own.

@@ -130,7 +130,9 @@ def build_write_approval_paths(home: str) -> set[str]:
 # rewrite. Session transcripts (state.db, sessions/) are application-owned
 # state whose rewrite can falsify history and break resume/compression;
 # mcp-tokens/ and pairing/ hold credential material.
-_HERMES_PROTECTED_SUBPATHS = ("state.db", "sessions", "mcp-tokens", "pairing")
+_HERMES_PROTECTED_SUBPATHS = (
+    "state.db", "sessions", "mcp-tokens", "pairing", "config.yaml", "SOUL.md",
+)
 
 
 def _classify_write_denial(path: str) -> Optional[str]:
@@ -152,6 +154,21 @@ def _classify_write_denial(path: str) -> Optional[str]:
             with suppress(Exception):
                 if _is_under(resolved, os.path.realpath(os.path.join(str(base), sub))):
                     return "credential"
+
+    # Every profile is a credential boundary, not only the active one. The
+    # active process may resolve another profile through an explicit path, so
+    # protect its state before the generic safe-root check as well.
+    with suppress(Exception):
+        profiles_root = _hermes_root_path().resolve() / "profiles"
+        target = Path(resolved)
+        relative = target.relative_to(profiles_root)
+        if len(relative.parts) >= 2:
+            profile_root = profiles_root / relative.parts[0]
+            for subpath in (*_HERMES_PROTECTED_SUBPATHS, *_CREDENTIAL_FILE_NAMES):
+                if _is_under(target, profile_root / subpath):
+                    return "credential"
+            if target.name.casefold() in _BLOCKED_PROJECT_ENV_BASENAMES:
+                return "credential"
 
     safe_roots = get_safe_write_roots()
     if safe_roots and not any(_is_under(resolved, root) for root in safe_roots):

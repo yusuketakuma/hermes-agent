@@ -417,6 +417,10 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         kb.claim_task(conn, tid)
         run1 = kb.latest_run(conn, tid)
         kbd._set_worker_pid(conn, tid, 98765)
+        # A dead PID without a reap record is now quarantined as
+        # result_unknown; provide the fixture's known non-zero exit evidence
+        # for this crash-retry lifecycle test.
+        kbd._record_worker_exit(98765, 1 << 8)
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
         assert kbd.detect_crashed_workers(conn) == [tid]
 
@@ -1327,16 +1331,8 @@ def _drive_nonzero_crash(conn, tid, fake_pid):
     return _drive_worker_exit(conn, tid, fake_pid, 256)
 
 
-def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
-    """Mixed failure kinds must not consume the violation retry budget.
-
-    Regression for the #61233 review finding: expressed as a plain
-    ``failure_limit`` over the unified ``consecutive_failures`` counter, the
-    violation budget was consumed by earlier timeouts / nonzero exits. As a
-    violation-only streak, a prior real crash must not eat violation
-    retries, and below-budget violations must leave the unified counter
-    untouched (so the two budgets stay independent).
-    """
+def test_protocol_violation_uses_unified_failure_budget(kanban_home):
+    """Clean-exit protocol violations share the finite failure budget."""
     import hermes_cli.kanban_db as _kb
     from hermes_cli import kanban_db_dispatch as _kbd
     conn = kbc.connect()
@@ -1350,28 +1346,15 @@ def test_protocol_violation_budget_not_consumed_by_other_failures(kanban_home):
         assert task.status == "ready"
         assert task.consecutive_failures == 1
 
-        # Two violations after it: streak 1 and 2 — both retry, unified
-        # counter untouched. (Pre-fix: the crash consumed the budget and the
-        # violations blocked well before three of them happened.)
-        for i, pid in enumerate((991001, 991002)):
-            _drive_protocol_violation(conn, tid, pid)
-            task = kb.get_task(conn, tid)
-            assert task.status == "ready", (
-                f"violation {i + 1} after a crash must still retry, "
-                f"got {task.status}"
-            )
-            assert task.consecutive_failures == 1, (
-                "below-budget violations must not tick the unified counter"
-            )
-
-        # Third consecutive violation: streak hits the bound — blocked.
-        _drive_protocol_violation(conn, tid, 991003)
+        # The next failure, regardless of its kind, reaches the shared limit.
+        _drive_protocol_violation(conn, tid, 991001)
         task = kb.get_task(conn, tid)
         assert task.status == "blocked"
+        assert task.consecutive_failures == 2
         gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
         assert len(gave_up) == 1
-        assert (gave_up[0].payload or {}).get("protocol_violations") == \
-            _kbd._PROTOCOL_VIOLATION_FAILURE_LIMIT
+        assert (gave_up[0].payload or {}).get("protocol_violation") is True
+        assert (gave_up[0].payload or {}).get("effective_limit") == 2
     finally:
         conn.close()
 
@@ -1414,5 +1397,3 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
-

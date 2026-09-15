@@ -32,7 +32,14 @@ def setup_runner(tmp_path, monkeypatch):
     for name in ("yuki", "other"):
         profile = home / "profiles" / name
         profile.mkdir(parents=True)
-        (profile / "config.yaml").write_text("{}\n", encoding="utf-8")
+        (profile / "config.yaml").write_text(
+            "discord:\n  server_targets:\n    - guild_id: guild\n      channel_ids:\n        - post\n",
+            encoding="utf-8",
+        )
+    (home / "config.yaml").write_text(
+        "discord:\n  server_targets:\n    - guild_id: guild\n      channel_ids:\n        - post\n",
+        encoding="utf-8",
+    )
     runner = GatewayRunner.__new__(GatewayRunner)
     runner.adapters = {Platform.DISCORD: RecordingAdapter()}
     runner._profile_adapters = {"yuki": {}}
@@ -192,4 +199,24 @@ def test_removed_profile_never_wakes_under_the_primary_runtime(tmp_path, monkeyp
     shutil.rmtree(tmp_path / ".hermes" / "profiles" / "yuki")
     asyncio.run(deliver(runner, rows))
     assert secondary.handled == []
+    assert unseen(task)
+
+
+def test_discord_notifier_refuses_target_before_adapter_send(tmp_path, monkeypatch):
+    runner = setup_runner(tmp_path, monkeypatch)
+    primary = runner.adapters[Platform.DISCORD]
+    task = completion(mode="notify")
+    rows = collect(runner)
+    failures = {}
+    monkeypatch.setattr(
+        "tools.send_message_tool._authorize_discord_channel_target",
+        lambda *args: "denied-for-test",
+    )
+
+    asyncio.run(_KanbanNotification(
+        runner, rows[0], platform_cls=Platform, sub_fail_counts=failures,
+    ).deliver())
+
+    assert primary.sent == []
+    assert failures[(task, "discord", "post", "post")] == 1
     assert unseen(task)

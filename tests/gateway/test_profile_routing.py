@@ -125,6 +125,25 @@ class TestParentChatIdMatching:
         assert m.profile == "trader"
 
 
+def test_route_only_matches_the_profile_owning_the_receiving_bot():
+    routes = parse_profile_routes([
+        {
+            "name": "cto-bot",
+            "platform": "discord",
+            "profile": "cto",
+            "chat_id": "222",
+            "bot_profile": "cto",
+        },
+    ])
+
+    assert match_profile_route(
+        routes, "discord", chat_id="222", adapter_profile="cto"
+    ).profile == "cto"
+    assert match_profile_route(
+        routes, "discord", chat_id="222", adapter_profile="default"
+    ) is None
+
+
 class TestForumPostMatching:
     """Test that forum posts match via parent_chat_id (direct parent)."""
 

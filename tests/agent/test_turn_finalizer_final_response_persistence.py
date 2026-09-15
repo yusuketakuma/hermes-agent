@@ -35,6 +35,7 @@ class FakeAgent:
         self._persist_user_message_idx: int | None = None
         self._persist_user_message_override: Any = None
         self._persist_user_message_timestamp: float | None = None
+        self._turn_bot_chat_delivery_records: list[dict[str, Any]] = []
 
     def _handle_max_iterations(self, messages, api_call_count):
         raise AssertionError("not expected")
@@ -79,6 +80,258 @@ class FakeAgent:
 
     def _sync_external_memory_for_turn(self, **_kwargs):
         pass
+
+
+def _finalize(agent, messages, response):
+    return finalize_turn(
+        agent,
+        final_response=response,
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="CROとCOOへPingして",
+        original_user_message="CROとCOOへPingして",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)",
+    )
+
+
+def test_bot_chat_claim_without_receipts_is_corrected_and_persisted(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "CROとCOOへPingして"},
+        {"role": "assistant", "content": "CRO・COOへPingを送信しました。"},
+    ]
+
+    result = _finalize(agent, messages, "CRO・COOへPingを送信しました。")
+
+    assert "上記の送信完了表現を取り消します" in result["final_response"]
+    assert "COO=送信未確認" in result["final_response"]
+    assert "CRO=送信未確認" in result["final_response"]
+    assert result["response_transformed"] is True
+    assert agent.persisted_messages[-1]["content"] == result["final_response"]
+
+
+def test_bot_chat_claim_with_matching_receipts_is_unchanged(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    for role in ("cro", "coo"):
+        agent._turn_bot_chat_delivery_records.append({
+            "args": {"action": "send", "recipient_role": role},
+            "result": '{"ok": true, "delivery": "sent"}',
+            "is_error": False,
+        })
+    response = "CRO・COOへPingを送信しました。"
+    messages = [{"role": "user", "content": "Pingして"}, {"role": "assistant", "content": response}]
+
+    result = _finalize(agent, messages, response)
+
+    assert result["final_response"] == response
+    assert result["response_transformed"] is False
+    assert agent.persisted_messages[-1]["content"] == response
+
+
+def test_bot_chat_claim_reports_partial_unknown_per_recipient(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._turn_bot_chat_delivery_records = [
+        {"args": {"action": "send", "recipient_role": "cro"},
+         "result": {"ok": True, "delivery": "sent"}, "is_error": False},
+        {"args": {"action": "send", "recipient_role": "coo"},
+         "result": "not-json", "is_error": True},
+    ]
+    response = "CRO・COOへPingを送信しました。"
+    messages = [{"role": "user", "content": "Pingして"}, {"role": "assistant", "content": response}]
+
+    result = _finalize(agent, messages, response)
+
+    assert "CRO=送信確認" in result["final_response"]
+    assert "COO=送信結果不明" in result["final_response"]
+
+
+def test_bot_chat_claim_does_not_reuse_receipt_for_another_coordination_id(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._turn_bot_chat_delivery_records = [{
+        "args": {"action": "send", "recipient_role": "cro", "coordination_id": "current-cro"},
+        "result": {"ok": True, "delivery": "sent"},
+        "is_error": False,
+    }]
+    response = "宛先: CRO\ncoordination_id: prior-cro\ndelivery: sent"
+    messages = [{"role": "user", "content": "Pingして"}, {"role": "assistant", "content": response}]
+
+    result = _finalize(agent, messages, response)
+
+    assert "話題ID=prior-cro=送信未確認" in result["final_response"]
+
+
+def test_bot_chat_negative_or_planned_wording_is_not_a_completion_claim(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    for response in (
+        "CROへは送信できませんでした。",
+        "COOへ送信する予定です。",
+        "> CROへ送信しました",
+        "Reply received from CRO. Pingを受け取りました。",
+    ):
+        agent = FakeAgent()
+        messages = [{"role": "user", "content": "status"}, {"role": "assistant", "content": response}]
+        result = _finalize(agent, messages, response)
+        assert result["final_response"] == response
+
+
+def test_bot_chat_claims_require_matching_recipient_and_coordination_id(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._turn_bot_chat_delivery_records = [
+        {"args": {"action": "send", "recipient_role": "cro", "coordination_id": "topic-a"},
+         "result": {"ok": True, "delivery": "sent"}, "is_error": False},
+        {"args": {"action": "send", "recipient_role": "coo", "coordination_id": "topic-b"},
+         "result": {"ok": True, "delivery": "sent"}, "is_error": False},
+    ]
+    response = (
+        "宛先: CRO\ncoordination_id: topic-b\ndelivery: sent\n\n"
+        "宛先: COO\ncoordination_id: topic-a\ndelivery: sent"
+    )
+    messages = [{"role": "user", "content": "status"}, {"role": "assistant", "content": response}]
+
+    result = _finalize(agent, messages, response)
+
+    assert "上記の送信完了表現を取り消します" in result["final_response"]
+    assert "話題ID=topic-a=送信未確認" in result["final_response"]
+    assert "話題ID=topic-b=送信未確認" in result["final_response"]
+
+
+def test_bot_chat_common_positive_claim_forms_are_checked(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    for response, expected in (
+        ("CRO、COOへ送信しました", ("CRO=送信未確認", "COO=送信未確認")),
+        ("宛先: CRO\ncoordination_id: topic-a\ndelivery: sent", ("CRO=送信未確認",)),
+        ("Sent a ping to CRO.", ("CRO=送信未確認",)),
+        ("CROへ送信できませんでしたがCOOへ送信しました", ("COO=送信未確認",)),
+        ("CROへ送信できず、COOへ送信しました", ("COO=送信未確認",)),
+        ("CROへ送信できませんでした\nCOOへ送信しました", ("COO=送信未確認",)),
+        ("CROから報告を受け、COOへ送信しました", ("COO=送信未確認",)),
+    ):
+        agent = FakeAgent()
+        messages = [{"role": "user", "content": "status"}, {"role": "assistant", "content": response}]
+        result = _finalize(agent, messages, response)
+        for marker in expected:
+            assert marker in result["final_response"]
+
+
+def test_bot_chat_non_claim_forms_do_not_trigger_gate(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    for response in (
+        "> CROへ送信しました。coordination_id: topic-a",
+        "CROから「送信しました」と報告を受けました",
+        "CROへ送信していませんでした",
+        "CRO will present tomorrow.",
+        "I have not sent a ping to CRO.",
+        "CRO sent me a ping.",
+        "「CROへ送信しました」という文は送信完了を意味します。",
+        "CROへ送信したわけではありません。",
+    ):
+        agent = FakeAgent()
+        messages = [{"role": "user", "content": "status"}, {"role": "assistant", "content": response}]
+        assert _finalize(agent, messages, response)["final_response"] == response
+
+
+def test_bot_chat_gate_survives_persistence_shaping_failure(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    agent._apply_persist_user_message_override = lambda _messages: (_ for _ in ()).throw(
+        RuntimeError("override failed")
+    )
+    response = "CROへ送信しました"
+    messages = [
+        {"role": "user", "content": "status"},
+        {"role": "assistant", "content": response, "api_content": response},
+    ]
+
+    result = _finalize(agent, messages, response)
+
+    assert "CRO=送信未確認" in result["final_response"]
+    assert result["messages"][-1]["content"] == result["final_response"]
+    assert "api_content" not in result["messages"][-1]
+    assert agent._session_messages[-1]["content"] == result["final_response"]
+    assert any("override failed" in error for error in result["cleanup_errors"])
+
+
+def test_bot_chat_gate_drops_stale_assistant_api_content(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    response = "CROへ送信しました"
+    messages = [
+        {"role": "user", "content": "status"},
+        {"role": "assistant", "content": response, "api_content": response},
+    ]
+
+    result = _finalize(agent, messages, response)
+
+    assert "api_content" not in result["messages"][-1]
+    assert "CRO=送信未確認" in result["messages"][-1]["content"]
+
+
+def test_bot_chat_status_parser_preserves_exact_ids_and_record_pairs(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    for response in (
+        "宛先: CRO\ncoordination_id: topic-a.new\ndelivery: sent",
+        "CROへ送信しました coordination_id: `topic-a.new`",
+        "宛先: `CRO`\ncoordination_id: `topic-a.new`\ndelivery: `sent`",
+    ):
+        agent = FakeAgent()
+        agent._turn_bot_chat_delivery_records = [{
+            "args": {"action": "send", "recipient_role": "cro", "coordination_id": "topic-a"},
+            "result": {"ok": True, "delivery": "sent"},
+            "is_error": False,
+        }]
+        messages = [{"role": "user", "content": "status"}, {"role": "assistant", "content": response}]
+        result = _finalize(agent, messages, response)
+        assert "話題ID=topic-a.new=送信未確認" in result["final_response"]
+
+    agent = FakeAgent()
+    agent._turn_bot_chat_delivery_records = [
+        {"args": {"action": "send", "recipient_role": "cro", "coordination_id": "topic-a"},
+         "result": {"ok": True, "delivery": "sent"}, "is_error": False},
+        {"args": {"action": "send", "recipient_role": "coo", "coordination_id": "topic-b"},
+         "result": {"ok": True, "delivery": "sent"}, "is_error": False},
+    ]
+    response = (
+        "宛先: CRO\ncoordination_id: topic-a\ndelivery: sent\n"
+        "宛先: COO\ncoordination_id: topic-b\ndelivery: sent"
+    )
+    messages = [{"role": "user", "content": "status"}, {"role": "assistant", "content": response}]
+    assert _finalize(agent, messages, response)["final_response"] == response
+
+
+def test_bot_chat_interrupted_nonempty_response_is_checked(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    response = "CROへ送信しました"
+    messages = [{"role": "user", "content": "status"}, {"role": "assistant", "content": response}]
+
+    result = finalize_turn(
+        agent,
+        final_response=response,
+        api_call_count=1,
+        interrupted=True,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="status",
+        original_user_message="status",
+        _should_review_memory=False,
+        _turn_exit_reason="interrupted",
+    )
+
+    assert "CRO=送信未確認" in result["final_response"]
 
 
 
@@ -446,4 +699,3 @@ def test_delivery_only_reasoning_excerpt_does_not_fill_blank_assistant(monkeypat
         and "only internal reasoning" in (m.get("content") or "")
         for m in result["messages"]
     )
-

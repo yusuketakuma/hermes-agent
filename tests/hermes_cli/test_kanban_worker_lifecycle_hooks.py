@@ -105,6 +105,7 @@ def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypa
         tid = kb.create_task(conn, title="t", assignee="worker")
         kb.claim_task(conn, tid)
         kbd._set_worker_pid(conn, tid, 98765)
+        kbd._record_worker_exit(98765, 1 << 8)
         monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
         assert kbd.detect_crashed_workers(conn) == [tid]
     finally:
@@ -116,8 +117,8 @@ def test_crash_reclaim_fires_worker_exited(kanban_home, captured_hooks, monkeypa
     assert kw["task_id"] == tid
     assert kw["assignee"] == "worker"
     assert kw["worker_pid"] == 98765
-    assert kw["exit_kind"] == "unknown"
-    assert kw["exit_code"] is None
+    assert kw["exit_kind"] == "nonzero_exit"
+    assert kw["exit_code"] == 1
     assert kw["outcome"] == "crashed"
     assert kw["retry_status"] == "ready"
     assert kw["run_id"] is not None
@@ -170,6 +171,7 @@ def test_raising_callbacks_never_break_worker_lifecycle(
             result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 111)
             assert any(row[0] == tid for row in result.spawned)
 
+            kbd._record_worker_exit(111, 1 << 8)
             monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
             assert kbd.detect_crashed_workers(conn) == [tid]
 

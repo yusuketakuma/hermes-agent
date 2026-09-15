@@ -78,7 +78,13 @@ def _patch_list_profiles(names: list[str]):
 
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="ship a feature", triage=True)
+        tid = kb.create_task(
+            conn, title="ship a feature", assignee="orchestrator", triage=True,
+            execution_scope={
+                "allowed_assignees": ["orchestrator", "researcher", "engineer"],
+                "max_children": 2, "max_descendants": 2,
+            },
+        )
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -160,5 +166,4 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
             p.stop()
     assert outcome.ok is False
     assert "not in triage" in outcome.reason
-
 

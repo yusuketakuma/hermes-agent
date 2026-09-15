@@ -615,6 +615,21 @@ class _KanbanNotification:
         # Pings, artifact uploads (media policy) and the wake text (display.language) all read the
         # SUBSCRIBER profile's config; the notifier thread itself runs in the launch profile's scope.
         async with self._owner_scope():
+            if self.platform_str == "discord":
+                from tools.send_message_tool import _authorize_discord_channel_target
+
+                discord_denial = _authorize_discord_channel_target(
+                    self.sub.get("chat_id"), self.sub.get("thread_id") or None)
+                if discord_denial:
+                    await self.delivery_failed(
+                        "kanban notifier: target authorization failed for %s on %s "
+                        "(attempt %d/%d): %s",
+                        (self.task_id, self.platform_str),
+                        "kanban notifier: dropping subscription %s on %s after %d "
+                        "consecutive target authorization failures",
+                        RuntimeError(discord_denial), False,
+                    )
+                    return
             if not await self._send_pings():
                 return
             # All text pings delivered (or skipped for non-push / wake-only).

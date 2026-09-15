@@ -14,7 +14,14 @@ def test_worker_create_keeps_durable_origin(tmp_path, monkeypatch, linked, expli
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     kb.init_db()
     with kbc.connect_closing() as conn:
-        owner = kb.create_task(conn, title="owner", session_id="durable")
+        owner = kb.create_task(
+            conn, title="owner", assignee="default", session_id="durable",
+            execution_scope={
+                "allowed_assignees": ["default"],
+                "max_children": 3,
+                "max_descendants": 3,
+            },
+        )
         kn.add_notify_sub(conn, task_id=owner, platform="discord", chat_id="chat",
                           user_id="user", notifier_profile="default", delivery_mode="notify",
                           delivery_metadata={"scope_id": "guild", "parent_chat_id": "forum"})

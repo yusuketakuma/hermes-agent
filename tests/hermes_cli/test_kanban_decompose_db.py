@@ -24,6 +24,7 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=None):
+    assignee = assignee or "orchestrator"
     return kb.create_task(
         conn,
         title=title,
@@ -31,6 +32,13 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=No
         assignee=assignee,
         tenant=tenant,
         triage=True,
+        execution_scope={
+            "allowed_assignees": [
+                "orchestrator", "orch", "researcher", "engineer", "default", "alice", "bob",
+            ],
+            "max_children": 6,
+            "max_descendants": 6,
+        },
     )
 
 
@@ -88,7 +96,6 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
 
     assert any("Decomposed into" in (c.body or "") for c in comments)
     assert any(ev.kind == "decomposed" for ev in events)
-
 
 
 

@@ -11,14 +11,20 @@ def test_creator_origin_survives_without_dependency_parent(tmp_path, monkeypatch
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     kb.init_db()
     with kbc.connect_closing() as conn:
-        owner = kb.create_task(conn, title="owner", session_id="durable", triage=True)
+        owner = kb.create_task(
+            conn, title="owner", assignee="default", session_id="durable", triage=True,
+            execution_scope={
+                "allowed_assignees": ["default"],
+                "max_children": 1, "max_descendants": 1,
+            },
+        )
         kn.add_notify_sub(conn, task_id=owner, platform="telegram", chat_id="chat",
                          delivery_mode="wake", notifier_profile="default")
         if surface == "builtin":
             tid = decompose_triage_task(conn, owner, root_assignee="default",
-                                       children=[{"title": "child"}])[0]
+                                       children=[{"title": "child", "assignee": "default"}])[0]
         elif surface == "db":
-            tid = kb.create_task(conn, title="child", creator_task_id=owner)
+            tid = kb.create_task(conn, title="child", assignee="default", creator_task_id=owner)
         else:
             import json
             import argparse
@@ -27,7 +33,9 @@ def test_creator_origin_survives_without_dependency_parent(tmp_path, monkeypatch
             parser = argparse.ArgumentParser()
             build_parser(parser.add_subparsers())
             monkeypatch.setenv("HERMES_KANBAN_TASK", owner)
-            assert kanban_command(parser.parse_args(["kanban", "create", "child", "--json"])) == 0
+            assert kanban_command(parser.parse_args(
+                ["kanban", "create", "child", "--assignee", "default", "--json"]
+            )) == 0
             tid = json.loads(capsys.readouterr().out)["id"]
         assert kb.get_task(conn, tid).session_id == "durable"
         subs = kn.list_notify_subs(conn, tid)

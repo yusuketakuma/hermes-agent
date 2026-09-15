@@ -134,6 +134,33 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     assert run is not None and run.outcome == "reclaimed"
 
 
+def test_surviving_descendant_is_quarantined_after_reopen(
+    conn, monkeypatch,
+):
+    """A control-plane reopen must not release a live worker into a duplicate spawn."""
+    parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
+    assert kb.complete_task(conn, parent_id)
+    child_id = kb.create_task(
+        conn, title="running child", assignee="builder", parents=[parent_id],
+    )
+    assert kb.claim_task(conn, child_id) is not None
+    kbd._set_worker_pid(conn, child_id, 424242)
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *_args, **_kwargs: {
+            "host_local": True, "termination_attempted": True, "terminated": False,
+        },
+    )
+
+    _reopen_parent_directly(conn, parent_id)
+    kb.invalidate_descendants_for_parent_reopen(conn, parent_id, author="operator")
+
+    child = kb.get_task(conn, child_id)
+    assert child is not None and child.status == "blocked"
+    assert any(event.kind == "result_unknown" for event in kb.list_events(conn, child_id))
+
+
 def test_counter_reset_on_invalidated_descendants(conn):
     parent_id, child_id = _done_parent_with_done_child(conn)
     with kb.write_txn(conn):

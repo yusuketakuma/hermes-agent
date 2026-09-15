@@ -67,6 +67,9 @@ _GLOBAL_ENV_EXACT = frozenset({
     "HERMES_HOME", "HERMES_PROFILE", "HERMES_GATEWAY_LOCK_DIR",
     "HERMES_MAX_ITERATIONS", "HERMES_API_TIMEOUT",
     "HERMES_REDACT_SECRETS", "HERMES_NOUS_TIMEOUT_SECONDS",
+    # One intentionally shared, read-only service credential. It is not a
+    # profile credential and never grants write/delete access to GBrain.
+    "HERMES_GBRAIN_READ_TOKEN",
     "_HERMES_GATEWAY",
     # OS / interpreter
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TZ", "PWD", "SHELL", "TMPDIR",

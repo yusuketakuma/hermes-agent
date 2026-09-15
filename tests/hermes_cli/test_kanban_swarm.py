@@ -49,6 +49,29 @@ def test_create_swarm_builds_parallel_workers_verifier_and_synthesizer(tmp_path)
         conn.close()
 
 
+def test_create_swarm_scope_follows_project_workspace_resolution(tmp_path, monkeypatch):
+    conn = kbc.connect(tmp_path / "kanban.db")
+    monkeypatch.setattr(kb, "_board_meta_for", lambda _board: {"project_id": "project"})
+    monkeypatch.setattr(
+        kb, "_resolve_project_link",
+        lambda *_args: ("project", None, None, "worktree"),
+    )
+    try:
+        created = create_swarm(
+            conn,
+            goal="Use the project workspace.",
+            workers=[SwarmWorkerSpec(profile="worker", title="Work", body="Work")],
+            verifier_assignee="reviewer",
+            synthesizer_assignee="writer",
+        )
+        root = kb.get_task(conn, created.root_id)
+        assert root is not None
+        assert root.workspace_kind == "worktree"
+        assert root.execution_scope["allowed_workspace_kinds"] == ["worktree"]
+    finally:
+        conn.close()
+
+
 def test_create_swarm_graph_is_atomic_and_rolls_back_partial_build(
     tmp_path, monkeypatch: pytest.MonkeyPatch
 ):

@@ -51,6 +51,26 @@ class DeliveryTransport:
     async def send(self, logical_platform: Platform, chat_id: str, content: str,
                    metadata: Optional[Dict[str, Any]]) -> Any:
         """Send through this transport while preserving the logical platform."""
+        if logical_platform == Platform.DISCORD:
+            thread_id = next(
+                (metadata.get(key) for key in _THREAD_ROUTING_KEYS
+                 if metadata and metadata.get(key)),
+                None,
+            )
+            try:
+                from tools.send_message_tool import _authorize_discord_channel_target
+
+                denial = _authorize_discord_channel_target(chat_id, thread_id)
+            except Exception:  # noqa: BLE001 - transport authorization must fail closed
+                logger.exception("Discord target authorization failed — refusing transport send")
+                denial = (
+                    "Refusing to send to Discord: the target authorization policy could not "
+                    "be loaded, so this destination could not be verified."
+                )
+            if denial:
+                from gateway.platforms.base import SendResult
+
+                return SendResult(success=False, error=denial)
         return await (self.adapter.send_for_platform(logical_platform, chat_id, content, metadata=metadata)
                       if self.is_relay else self.adapter.send(chat_id, content, metadata=metadata))
 

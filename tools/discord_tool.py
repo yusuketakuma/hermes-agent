@@ -4,6 +4,8 @@ The model-visible schema is filtered by two gates: privileged intents from GET /
 (search_members / member_info need GUILD_MEMBERS; fetch_messages / list_pins are annotated when
 MESSAGE_CONTENT is missing) and the ``discord.server_actions`` config allowlist. Per-guild
 permissions are NOT pre-checked — a call-time 403 is mapped to guidance by :func:`_enrich_403`.
+Guild/channel targets are additionally restricted by ``discord.server_targets``; the same
+channel allowlist is reused by outbound ``send_message`` and cron delivery.
 """
 
 import functools
@@ -418,6 +420,19 @@ _REQUIRED_PARAMS: Dict[str, List[str]] = {
 _CORE_ACTION_NAMES = frozenset({"fetch_messages", "search_members", "create_thread"})
 _CORE_ACTIONS = {k: v for k, v in _ACTIONS.items() if k in _CORE_ACTION_NAMES}
 _ADMIN_ACTIONS = {k: v for k, v in _ACTIONS.items() if k not in _CORE_ACTION_NAMES}
+_MUTATING_ACTIONS = frozenset({
+    "create_thread", "pin_message", "unpin_message", "delete_message",
+    "add_role", "remove_role",
+})
+_GUILD_TARGET_ACTIONS = frozenset({
+    "server_info", "list_channels", "list_roles", "member_info", "search_members",
+    "add_role", "remove_role",
+})
+_CHANNEL_TARGET_ACTIONS = frozenset({
+    "channel_info", "fetch_messages", "list_pins", "pin_message", "unpin_message",
+    "delete_message", "create_thread",
+})
+_TARGET_SCOPED_ACTIONS = _GUILD_TARGET_ACTIONS | _CHANNEL_TARGET_ACTIONS
 
 # Actions that require the GUILD_MEMBERS privileged intent.
 _INTENT_GATED_MEMBERS = frozenset({"member_info", "search_members"})
@@ -425,12 +440,12 @@ _INTENT_GATED_MEMBERS = frozenset({"member_info", "search_members"})
 
 def _load_allowed_actions_config() -> Optional[List[str]]:
     """``discord.server_actions`` allowlist (comma string or YAML list), or ``None`` when
-    unrestricted. Unknown names are dropped with a warning."""
+    no mutating action has been explicitly enabled. Unknown names are dropped with a warning."""
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
     except Exception as exc:
-        logger.debug("discord: could not load config (%s); allowing all actions.", exc)
+        logger.debug("discord: could not load config (%s); disabling mutating actions.", exc)
         return None
     raw = (cfg.get("discord") or {}).get("server_actions")
     if raw is None or raw == "":
@@ -449,12 +464,67 @@ def _load_allowed_actions_config() -> Optional[List[str]]:
     return [n for n in names if n in _ACTIONS]
 
 
+def _load_allowed_targets_config() -> Optional[List[Dict[str, Any]]]:
+    """Return exact Discord guild/channel targets, or ``None`` when unset.
+
+    Each entry is ``{"guild_id": "...", "channel_ids": ["..."]}``. An empty
+    ``channel_ids`` list permits guild-scoped metadata/actions only; it never
+    permits a channel-scoped action.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+    except Exception as exc:
+        logger.debug("discord: could not load target config (%s); denying targets.", exc)
+        return None
+    raw = (cfg.get("discord") or {}).get("server_targets")
+    if raw is None or raw == "":
+        return None
+    if not isinstance(raw, (list, tuple)):
+        logger.warning("discord.server_targets: expected a YAML list; denying targets.")
+        return []
+
+    targets: List[Dict[str, Any]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            logger.warning("discord.server_targets[%d]: expected an object; ignored.", index)
+            continue
+        guild_id = item.get("guild_id")
+        channel_ids = item.get("channel_ids", [])
+        if (
+            not isinstance(guild_id, str) or not guild_id.strip()
+            or not isinstance(channel_ids, (list, tuple))
+            or any(not isinstance(value, str) or not value.strip() for value in channel_ids)
+        ):
+            logger.warning("discord.server_targets[%d]: malformed entry; ignored.", index)
+            continue
+        targets.append({
+            "guild_id": guild_id.strip(),
+            "channel_ids": [value.strip() for value in channel_ids],
+        })
+    return targets
+
+
+def _target_allowed(action: str, params: Dict[str, Any], targets: Optional[List[Dict[str, Any]]]) -> bool:
+    """Check the exact target required by a guild/channel-addressed action."""
+    if action not in _GUILD_TARGET_ACTIONS and action not in _CHANNEL_TARGET_ACTIONS:
+        return True
+    if not targets:
+        return False
+    if action in _GUILD_TARGET_ACTIONS:
+        guild_id = params.get("guild_id")
+        return any(target["guild_id"] == guild_id for target in targets)
+    channel_id = params.get("channel_id")
+    return any(channel_id in target["channel_ids"] for target in targets)
+
+
 def _available_actions(caps: Dict[str, Any], allowlist: Optional[List[str]]) -> List[str]:
     """Visible actions from intents + config allowlist, in :data:`_ACTIONS` order."""
     members_ok = caps.get("has_members_intent", True)
     return [
         name for name in _ACTIONS
-        if (members_ok or name not in _INTENT_GATED_MEMBERS) and (allowlist is None or name in allowlist)]
+        if (members_ok or name not in _INTENT_GATED_MEMBERS)
+        and (name not in _MUTATING_ACTIONS if allowlist is None else name in allowlist)]
 
 
 # ── schema construction ──────────────────────────────────────────────────────
@@ -462,13 +532,15 @@ _TOOL_DESCRIPTIONS = {
     "discord_admin": (
         "Manage a Discord server via the REST API.",
         "Call list_guilds first to discover guild_ids, then list_channels for "
-        "channel_ids. Runtime errors will tell you if the bot lacks a specific "
-        "per-guild permission (e.g. MANAGE_ROLES for add_role).",
+        "channel_ids. Exact guild/channel targets must also be configured in "
+        "discord.server_targets. Runtime errors will tell you if the bot lacks "
+        "a specific per-guild permission (e.g. MANAGE_ROLES for add_role).",
     ),
     "discord": (
         "Read and participate in a Discord server.",
         "Use the channel_id from the current conversation context. "
-        "Use search_members to look up user IDs by name prefix.",
+        "Use search_members to look up user IDs by name prefix. Exact guild/channel "
+        "targets must be configured in discord.server_targets.",
     ),
 }
 
@@ -533,7 +605,11 @@ def _get_dynamic_schema(action_subset: Dict[str, Any], tool_name: str) -> Option
     if not token:
         return None
     caps = _detect_capabilities_nonblocking(token)
-    actions = [a for a in _available_actions(caps, _load_allowed_actions_config()) if a in action_subset]
+    targets = _load_allowed_targets_config()
+    actions = [
+        a for a in _available_actions(caps, _load_allowed_actions_config())
+        if a in action_subset and (a not in _TARGET_SCOPED_ACTIONS or targets)
+    ]
     return _build_schema(actions, caps, tool_name=tool_name) if actions else None
 
 
@@ -599,10 +675,18 @@ def _run_discord_action(action: str, valid_actions: Dict[str, Any], tool_label: 
         return tool_error(
             f"Action '{action}' is disabled by config (discord.server_actions). "
             f"Allowed: {', '.join(allowlist) if allowlist else '<none>'}")
+    if allowlist is None and action in _MUTATING_ACTIONS:
+        return tool_error(
+            f"Action '{action}' requires an explicit discord.server_actions allowlist; "
+            "read-only Discord actions remain available until an operator enables it.")
     kwargs = {k: params.get(k, v) for k, v in _HANDLER_DEFAULTS.items()}
     missing = [p for p in _REQUIRED_PARAMS.get(action, []) if not kwargs.get(p)]
     if missing:
         return tool_error(f"Missing required parameters for '{action}': {', '.join(missing)}")
+    if not _target_allowed(action, kwargs, _load_allowed_targets_config()):
+        return tool_error(
+            f"Action '{action}' is outside discord.server_targets; configure an exact "
+            "matching guild_id or channel_id before using it.")
     try:
         return action_fn(token=token, **kwargs)
     except DiscordAPIError as e:

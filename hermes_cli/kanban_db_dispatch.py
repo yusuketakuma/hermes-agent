@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -111,7 +112,11 @@ class DispatchResult:
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
     tick; separate bucket so dashboards show "profile busy" vs "stuck"."""
     crashed: list[str] = field(default_factory=list)
-    """Task ids reclaimed because their worker PID disappeared."""
+    """Task ids reclaimed because their worker PID disappeared with a known
+    crash-like exit outcome."""
+    result_unknown: list[str] = field(default_factory=list)
+    """Task ids quarantined because the worker disappeared without a
+    trustworthy exit record; an operator must explicitly unblock them."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
     timed_out: list[str] = field(default_factory=list)
@@ -124,8 +129,8 @@ class DispatchResult:
     within guard window), ``"active_pr"`` (GitHub PR URL in a recent comment)."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
-    (EX_TEMPFAIL sentinel exit) and were released to ``ready`` WITHOUT counting
-    a failure — a long quota window must never trip the circuit breaker."""
+    (EX_TEMPFAIL sentinel exit) and were released to ``ready``; the finite
+    failure counter still prevents an endless cooldown loop."""
     skipped_locked: bool = False
     """True when another process held the board's dispatch lock: this tick did
     no DB writes; the lock holder is making progress on the same board."""
@@ -165,9 +170,9 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     """``(kind, code)`` for a reaped worker PID: ``clean_exit`` (rc 0 while
     still ``running`` = protocol violation), ``rate_limited``
-    (``KANBAN_RATE_LIMIT_EXIT_CODE``, never counts as a failure),
-    ``nonzero_exit``, ``signaled`` (``code`` is the signal), ``unknown`` (pid
-    not in the reap registry; ``code`` None)."""
+    (``KANBAN_RATE_LIMIT_EXIT_CODE``), ``nonzero_exit``, ``signaled``
+    (``code`` is the signal), ``unknown`` (pid not in the reap registry;
+    ``code`` None and unsafe to replay)."""
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
@@ -303,27 +308,54 @@ def _terminate_reclaimed_worker(
     info["host_local"] = True
 
     kill = _kill_fn(signal_fn)
-    if kill is None:
+    if kill is None and signal_fn is None:
         return info
 
     info["termination_attempted"] = True
+
+    def _signal(sig: int) -> bool:
+        if signal_fn is not None:
+            signal_fn(int(pid), sig)
+            return True
+        try:
+            from agent.deadline import kill_process_tree
+            return bool(kill_process_tree(int(pid), sig=sig))
+        except (ProcessLookupError, OSError):
+            return False
+        except Exception:
+            # Keep the old single-PID fallback if the shared tree helper is
+            # unavailable; the liveness check below still fails closed.
+            try:
+                os.kill(int(pid), sig)
+                return True
+            except (ProcessLookupError, OSError):
+                return False
+
     try:
-        kill(int(pid), signal.SIGTERM)
+        delivered = _signal(signal.SIGTERM)
     except ProcessLookupError:
         # Already gone = successful termination. Leaving terminated=False would
         # make the reclaim guard misread a dead worker as alive and defer forever.
         info["terminated"] = True
         return info
     except OSError:
+        delivered = False
+
+    if not delivered and not _kb._pid_alive(pid):
+        info["terminated"] = True
         return info
 
     if _poll_worker_exit(pid):
         info["terminated"] = True
         return info
     if _kb._pid_alive(pid):
-        if not _sigkill(kill, pid):
+        try:
+            killed = _signal(getattr(signal, "SIGKILL", signal.SIGTERM))
+        except (ProcessLookupError, OSError):
+            killed = False
+        if not killed and _kb._pid_alive(pid):
             return info
-        info["sigkill"] = True
+        info["sigkill"] = bool(killed)
     info["terminated"] = not _kb._pid_alive(pid)
     return info
 
@@ -376,6 +408,31 @@ def _defer_reclaim_for_live_worker(
         _kb._append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
 
 
+def _quarantine_surviving_worker(
+    conn: sqlite3.Connection, task_id: str, termination: dict[str, Any], *, reason: str,
+) -> bool:
+    """Block a task whose already-released worker survived a control-plane kill.
+
+    Dashboard/ancestor-reopen paths must commit their audit transition before
+    sending a signal. If the process ignores that signal, quarantine the task
+    after the commit so the next dispatcher tick cannot start a duplicate.
+    """
+    error = f"worker survived termination request ({reason})"
+    with _kb.write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'blocked', last_failure_error = ? "
+            "WHERE id = ? AND status IN ('todo', 'ready', 'review') "
+            "AND claim_lock IS NULL",
+            (error[:500], task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        payload = {"reason": reason, "result_unknown": True}
+        payload.update(termination)
+        _kb._append_event(conn, task_id, "result_unknown", payload)
+    return True
+
+
 def heartbeat_worker(
     conn: sqlite3.Connection,
     task_id: str,
@@ -414,7 +471,9 @@ def heartbeat_worker(
     return True
 
 
-def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str]:
+def enforce_max_runtime(
+    conn: sqlite3.Connection, *, signal_fn=None, failure_limit: Optional[int] = None,
+) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
     SIGTERM, short grace, then SIGKILL. Emits ``timed_out`` and restores the
@@ -449,17 +508,18 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
 
         pid = int(row["worker_pid"])
         tid = row["id"]
-        # SIGTERM then SIGKILL after 5 s grace; workers wanting a cleaner
-        # shutdown install their own SIGTERM handler.
-        killed = False
-        kill = _kill_fn(signal_fn)
-        if kill is not None:
-            with contextlib.suppress(ProcessLookupError, OSError):
-                kill(pid, signal.SIGTERM)
-            # Short polling wait — no time.sleep on the write txn.
-            _poll_worker_exit(pid)
-            if _kb._pid_alive(pid):
-                killed = _sigkill(kill, pid)
+        # SIGTERM then SIGKILL after the shared bounded grace; the helper also
+        # terminates descendants so a timed-out worker cannot leave a child
+        # writing outside the task lifecycle.
+        termination = _kb._terminate_reclaimed_worker(
+            pid, row["claim_lock"], signal_fn=signal_fn,
+        )
+        if _worker_survived_termination(termination):
+            _defer_reclaim_for_live_worker(
+                conn, tid, row["claim_lock"], now, termination,
+                reason="max_runtime_worker_alive",
+            )
+            continue
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
@@ -477,9 +537,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                     "pid": pid,
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": limit,
-                    "sigkill": killed,
+                    "sigkill": bool(termination.get("sigkill")),
                     "retry_status": retry_status,
                 }
+                payload.update(termination)
                 run_id = _kb._end_run(
                     conn, tid, outcome="timed_out", status="timed_out",
                     error=error, metadata=payload,
@@ -496,7 +557,11 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
-                event_payload_extra={"pid": pid, "sigkill": killed, "retry_status": retry_status},
+                failure_limit=failure_limit,
+                event_payload_extra={
+                    "pid": pid, "sigkill": bool(termination.get("sigkill")),
+                    "retry_status": retry_status,
+                },
             )
     return timed_out
 
@@ -527,6 +592,7 @@ def detect_stale_running(
 
     now = int(time.time())
     reclaimed: list[str] = []
+    host_prefix = _kb._host_prefix()
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
@@ -551,6 +617,8 @@ def detect_stale_running(
         pid = row["worker_pid"]
         tid = row["id"]
         lock = row["claim_lock"] or ""
+        if not lock.startswith(host_prefix):
+            continue
 
         termination = _kb._terminate_reclaimed_worker(pid, lock, signal_fn=signal_fn)
 
@@ -614,12 +682,15 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     """
     now = int(time.time())
     reconciled: list[str] = []
+    host_prefix = _kb._host_prefix()
     rows = conn.execute(
         "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
     for row in rows:
+        if row["claim_lock"] and not row["claim_lock"].startswith(host_prefix):
+            continue
         tid = row["id"]
         pid = row["worker_pid"]
         if pid and _kb._pid_alive(pid):
@@ -675,46 +746,8 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
-# ~96% of "clean exit without a terminal tool call" tasks complete on a later
-# run, so a protocol violation gets a bounded retry before the breaker trips.
-# The budget is a violation-only STREAK (``_protocol_violation_streak``),
-# independent of ``consecutive_failures``: other failure kinds neither consume
-# nor extend it. Per-task ``max_retries`` overrides it.
-_PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
-
-# Closed runs to walk when counting the streak; it trips at a handful anyway.
-_PROTOCOL_VIOLATION_SCAN_LIMIT = 50
-
-
-def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
-    """Count the task's trailing run of clean-exit protocol violations.
-
-    Walks closed runs newest-first (including the one ``detect_crashed_workers``
-    just closed). ``rate_limited`` runs are neutral and skipped (a quota wall
-    says nothing about the task); any other closed run breaks the streak, so
-    the budget counts ONLY protocol violations. Violations are recognized by the
-    ``protocol_violation`` run-metadata marker, with the error text as fallback
-    for runs recorded before the marker existed.
-    """
-    streak = 0
-    rows = conn.execute(
-        "SELECT outcome, error, metadata FROM task_runs "
-        "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY id DESC LIMIT ?",
-        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
-    ).fetchall()
-    for row in rows:
-        outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
-            continue
-        if outcome == "crashed" and (
-            _kb._json_dict(row["metadata"]).get("protocol_violation")
-            or "protocol violation" in (row["error"] or "")
-        ):
-            streak += 1
-            continue
-        break
-    return streak
+# Clean exits without a terminal tool call use the same finite failure budget
+# as crashes and timeouts; no separate retry counter can bypass the breaker.
 
 
 _PROTOCOL_VIOLATION_ERROR = (
@@ -742,9 +775,12 @@ class _DeadWorker:
     event_payload: dict
     protocol_violation: bool = False
     rate_limited: bool = False
+    result_unknown: bool = False
 
     @property
     def run_outcome(self) -> str:
+        if self.result_unknown:
+            return "result_unknown"
         # A rate-limited requeue is recorded as ``rate_limited`` so board history
         # doesn't show a phantom crash for a quota wall.
         return "rate_limited" if self.rate_limited else "crashed"
@@ -766,11 +802,11 @@ def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
             protocol_violation=True,
         )
     if kind == "rate_limited":
-        # Quota wall — NOT a task failure. Release to the source phase and do
-        # NOT count a failure so a long quota window can't trip the breaker.
+        # Quota wall — keep a distinct run outcome and cooldown behavior, but
+        # count it against the finite task failure budget after reclaim.
         return _DeadWorker(
             kind, code,
-            f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
+            f"pid {pid} exited rate-limited (quota wall) — requeued with a bounded failure count",
             "rate_limited",
             {"pid": pid, "claimer": claimer, "exit_code": code},
             rate_limited=True,
@@ -780,7 +816,12 @@ def _classify_dead_worker(pid: int, claimer: Optional[str]) -> _DeadWorker:
     elif kind == "signaled":
         error_text = f"pid {pid} killed by signal {code}"
     else:
-        error_text = f"pid {pid} not alive"
+        error_text = f"pid {pid} disappeared without a trustworthy exit record"
+        return _DeadWorker(
+            kind, code, error_text, "result_unknown",
+            {"pid": pid, "claimer": claimer, "result_unknown": True},
+            result_unknown=True,
+        )
     event_payload = {"pid": pid, "claimer": claimer}
     if code is not None and kind != "unknown":
         event_payload["exit_kind"] = kind
@@ -793,10 +834,17 @@ class _CrashSweep:
     """Everything ``detect_crashed_workers`` collects inside its reclaim txn."""
 
     crashed: list[str] = field(default_factory=list)
+    result_unknown: list[str] = field(default_factory=list)
     rate_limited: list[str] = field(default_factory=list)
     # ``(task_id, pid, claimer, protocol_violation, error_text)``: accounted
     # after the txn via ``_record_task_failure`` (needs its own write_txn).
     crash_details: list[tuple[str, int, str, bool, str]] = field(default_factory=list)
+    # Same accounting for quota-wall exits, while keeping them out of the
+    # public ``crashed`` list.
+    rate_limit_details: list[tuple[str, int, str, str]] = field(default_factory=list)
+    # Same accounting for exit records that were unavailable at reap time;
+    # these are quarantined instead of being retried.
+    result_unknown_details: list[tuple[str, int, str, str]] = field(default_factory=list)
     # Worker-exit observer payloads, fired only after every reclaim/accounting
     # txn has committed.
     exited_hook_payloads: list[dict] = field(default_factory=list)
@@ -826,7 +874,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
 
             pid = int(row["worker_pid"])
             dead = _classify_dead_worker(pid, row["claim_lock"])
-            retry_status = _kb._retry_status_for_run(conn, row["id"])
+            # A missing exit record means the task's side effects cannot be
+            # classified. Quarantine it; replay is an operator decision.
+            retry_status = (
+                "blocked" if dead.result_unknown
+                else _kb._retry_status_for_run(conn, row["id"])
+            )
             dead.event_payload["retry_status"] = retry_status
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -854,18 +907,23 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
-                # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
-                # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
-                # ``_record_task_failure`` (which stamps this column), yet the
-                # board UI and retry worker need the corrective message.
+            if dead.rate_limited or dead.protocol_violation or dead.result_unknown:
+                # Stamp the error before the post-reclaim counter accounting;
+                # the cooldown guard needs the quota text immediately.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                     (dead.error_text[:500], row["id"]),
                 )
-            if dead.rate_limited:
+            if dead.result_unknown:
+                sweep.result_unknown.append(row["id"])
+                sweep.result_unknown_details.append(
+                    (row["id"], pid, row["claim_lock"], dead.error_text)
+                )
+            elif dead.rate_limited:
                 sweep.rate_limited.append(row["id"])
+                sweep.rate_limit_details.append(
+                    (row["id"], pid, row["claim_lock"], dead.error_text)
+                )
             else:
                 sweep.crashed.append(row["id"])
                 sweep.crash_details.append(
@@ -874,13 +932,14 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
     return sweep
 
 
-def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
+def _account_crashes(
+    conn: sqlite3.Connection, crash_details: list, *, failure_limit: Optional[int] = None,
+) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
-    Protocol violations get a BOUNDED violation-only budget independent of
-    ``consecutive_failures`` (per-task ``max_retries`` takes precedence);
-    systemic same-error crashes (>= 3 identical fingerprints this tick) trip
-    immediately.
+    Every exit class, including clean-exit protocol violations, consumes the
+    same finite consecutive-failure budget. Systemic same-error crashes (>= 3
+    identical fingerprints this tick) still trip immediately.
     """
     auto_blocked: list[str] = []
     fp_counts: dict[str, int] = {}
@@ -888,70 +947,89 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
         fp = _error_fingerprint(err_text)
         fp_counts[fp] = fp_counts.get(fp, 0) + 1
     for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
+        extra = {"pid": pid, "claimer": claimer}
         if protocol_violation:
-            streak = _protocol_violation_streak(conn, tid)
-            trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
-            if trow is None:
-                continue  # task deleted mid-loop
-            task_override = _kb._row_get(trow, "max_retries")
-            violation_limit = (
-                int(task_override) if task_override is not None else _PROTOCOL_VIOLATION_FAILURE_LIMIT
-            )
-            if streak < violation_limit:
-                # Below budget: already back at ``ready`` with the error stamped.
-                # No ``_record_task_failure`` — must not consume the unified budget.
-                continue
-            # ``force_trip``: the decision (incl. per-task ``max_retries``) was
-            # already made against the violation streak above.
-            tripped = _record_task_failure(
-                conn, tid,
-                error=error_text,
-                outcome="crashed",
-                failure_limit=violation_limit,
-                force_trip=True,
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={
-                    "pid": pid,
-                    "claimer": claimer,
-                    "protocol_violations": streak,
-                    "protocol_violation_limit": violation_limit,
-                },
-            )
-        else:
-            is_systemic = fp_counts.get(_error_fingerprint(error_text), 0) >= 3
-            tripped = _record_task_failure(
-                conn, tid,
-                error=error_text,
-                outcome="crashed",
-                failure_limit=1 if is_systemic else None,
-                release_claim=False,
-                end_run=False,
-                event_payload_extra={"pid": pid, "claimer": claimer},
-            )
+            extra["protocol_violation"] = True
+        tripped = _record_task_failure(
+            conn, tid,
+            error=error_text,
+            outcome="crashed",
+            failure_limit=1 if is_systemic else failure_limit,
+            release_claim=False,
+            end_run=False,
+            event_payload_extra=extra,
+        )
         if tripped:
             auto_blocked.append(tid)
     return auto_blocked
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def _account_rate_limits(
+    conn: sqlite3.Connection, rate_limit_details: list, *, failure_limit: Optional[int] = None,
+) -> list[str]:
+    """Count quota-wall exits without treating them as ordinary crashes."""
+    auto_blocked: list[str] = []
+    for tid, pid, claimer, error_text in rate_limit_details:
+        if _record_task_failure(
+            conn, tid, error=error_text, outcome="rate_limited",
+            failure_limit=failure_limit, release_claim=False, end_run=False,
+            event_payload_extra={"pid": pid, "claimer": claimer, "rate_limited": True},
+        ):
+            auto_blocked.append(tid)
+    return auto_blocked
+
+
+def _account_result_unknown(
+    conn: sqlite3.Connection, details: list, *, failure_limit: Optional[int] = None,
+) -> list[str]:
+    """Record an unverified worker outcome and keep the task quarantined."""
+    auto_blocked: list[str] = []
+    for tid, pid, claimer, error_text in details:
+        _record_task_failure(
+            conn, tid, error=error_text, outcome="result_unknown",
+            failure_limit=1, force_trip=True, release_claim=False, end_run=False,
+            event_payload_extra={
+                "pid": pid, "claimer": claimer, "result_unknown": True,
+            },
+        )
+        # ``gave_up`` is not sticky by itself. The result-unknown event emitted
+        # by the reclaim txn is the durable operator gate; ``unblock_task``
+        # emits ``unblocked`` to clear it.
+        auto_blocked.append(tid)
+    return auto_blocked
+
+
+def detect_crashed_workers(
+    conn: sqlite3.Connection, *, failure_limit: Optional[int] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Restores the source phase immediately (no waiting for the claim TTL), for
     tasks claimed by *this host* only — other hosts' PIDs are meaningless.
-    Clean exit while ``running`` is a protocol violation with a bounded
-    violation-only retry budget; ``KANBAN_RATE_LIMIT_EXIT_CODE`` is a quota
-    wall, released WITHOUT counting a failure and surfaced via the
-    ``_last_rate_limited`` attribute (the return stays crashed-only).
+    Clean exit while ``running`` is a protocol violation and
+    ``KANBAN_RATE_LIMIT_EXIT_CODE`` is a quota wall; both consume the same
+    finite failure budget, while the latter remains out of the public
+    crashed-only return. Missing exit evidence is quarantined as
+    ``result_unknown`` and never retried automatically.
     """
     sweep = _reclaim_dead_workers(conn)
     # Outside the main txn: account each crash and maybe trip the breaker.
-    auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
+    auto_blocked = _account_crashes(
+        conn, sweep.crash_details, failure_limit=failure_limit,
+    ) if sweep.crash_details else []
+    auto_blocked.extend(_account_rate_limits(
+        conn, sweep.rate_limit_details, failure_limit=failure_limit,
+    ))
+    auto_blocked.extend(_account_result_unknown(
+        conn, sweep.result_unknown_details, failure_limit=failure_limit,
+    ))
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
-    # requeues did NOT count a failure and are NOT crashes.
+    # requeues remain outside the public crashed list.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = sweep.rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_result_unknown = sweep.result_unknown  # type: ignore[attr-defined]
     # Fired only now, after the reclaim txn AND breaker accounting have
     # committed, so subscribers always observe fully durable board state.
     if sweep.exited_hook_payloads and _kb._kanban_observer_consumed("on_kanban_worker_exited"):
@@ -1130,8 +1208,7 @@ def check_respawn_guard(
     Called per ready/review row before any claim attempt. Priority order:
     ``"rate_limit_cooldown"`` (latest run ``rate_limited`` within the cooldown;
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
-    ``last_failure_error`` that would otherwise park the task forever — that
-    path never increments ``consecutive_failures``), ``"blocker_auth"``
+    ``last_failure_error``), ``"blocker_auth"``
     (quota/auth pattern; the breaker still trips eventually), then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
@@ -1166,8 +1243,9 @@ def check_respawn_guard(
         if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
             return "rate_limit_cooldown"
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
-        # stamped rate-limit text; this path intentionally retries forever
-        # (spaced by the cooldown) until quota returns or a real run supersedes it.
+        # stamped rate-limit text. The failure counter was accounted during
+        # reclaim; once its finite breaker trips, the task is blocked and this
+        # guard is no longer reached.
         return None
 
     # 2. Quota / auth blocker: retrying immediately will not help.
@@ -1224,6 +1302,54 @@ def _profile_exists_fn() -> Optional[Callable[[str], bool]]:
     except Exception:
         return None
     return profile_exists
+
+
+def _execution_scope_error(task: Task, workspace: Optional[str] = None) -> Optional[str]:
+    """Return a dispatch-time scope mismatch.
+
+    Rows predating execution scopes remain readable for audit, but are not
+    eligible for autonomous execution until an operator recreates or updates
+    them through the scoped creation path.
+    """
+    scope = task.execution_scope
+    if not isinstance(scope, dict):
+        return "task has no execution_scope; autonomous dispatch is disabled"
+    if scope.get("version") != _kb._EXECUTION_SCOPE_VERSION:
+        return "execution_scope is invalid or unsupported"
+    try:
+        # Re-validate persisted JSON at the trust boundary; hand-edited or
+        # partially migrated rows must fail closed instead of changing Python
+        # membership semantics (for example, string vs list allow-lists).
+        scope = _kb._normalize_execution_scope(
+            scope,
+            assignee=task.assignee,
+            workspace_kind=task.workspace_kind,
+            max_runtime_seconds=task.max_runtime_seconds,
+            max_retries=task.max_retries,
+            model_override=task.model_override,
+            provider_override=task.provider_override,
+        )
+    except (TypeError, ValueError):
+        return "execution_scope is invalid or unsupported"
+    if task.assignee not in scope.get("allowed_assignees", ()):
+        return "assignee is outside execution_scope.allowed_assignees"
+    if task.workspace_kind not in scope.get("allowed_workspace_kinds", ()):
+        return "workspace kind is outside execution_scope.allowed_workspace_kinds"
+    roots = scope.get("allowed_workspace_roots")
+    path = workspace or task.workspace_path
+    # Worktree paths can be materialized from the board anchor only after the
+    # claim. The second check below runs after resolution; an unresolved path
+    # is not an authorization failure by itself.
+    if roots is not None and path is not None and not _kb._scope_path_allowed(path, roots):
+        return "workspace path is outside execution_scope.allowed_workspace_roots"
+    routes = scope.get("allowed_model_routes", ())
+    if routes:
+        route = (task.provider_override, task.model_override)
+        if not task.model_override:
+            return "execution_scope requires an explicit model route"
+        if route not in {(item.get("provider"), item.get("model")) for item in routes}:
+            return "model/provider route is outside execution_scope.allowed_model_routes"
+    return None
 
 
 def _has_spawnable(conn: sqlite3.Connection, status: str) -> bool:
@@ -1551,6 +1677,14 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    scope_error = _execution_scope_error(claimed)
+    if scope_error:
+        if _record_task_failure(
+            conn, claimed.id, f"scope: {scope_error}", outcome="scope_violation",
+            failure_limit=1, force_trip=True, release_claim=True, end_run=True,
+        ):
+            result.auto_blocked.append(claimed.id)
+        return False
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
@@ -1561,6 +1695,14 @@ def _dispatch_lane_task(
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+        ):
+            result.auto_blocked.append(claimed.id)
+        return False
+    scope_error = _execution_scope_error(claimed, str(workspace))
+    if scope_error:
+        if _record_task_failure(
+            conn, claimed.id, f"scope: {scope_error}", outcome="scope_violation",
+            failure_limit=1, force_trip=True, release_claim=True, end_run=True,
         ):
             result.auto_blocked.append(claimed.id)
         return False
@@ -1606,11 +1748,33 @@ def _apply_default_assignee(
         return True
     try:
         with _kb.write_txn(conn):
-            conn.execute(
-                "UPDATE tasks SET assignee = ? WHERE id = ? "
-                "AND (assignee IS NULL OR assignee = '')",
-                (assignee, task_id),
-            )
+            row = conn.execute(
+                "SELECT assignee, execution_scope FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            if row is None or row["assignee"]:
+                return False
+            scope = _kb._json_dict(row["execution_scope"])
+            fallback = _kb._canonical_assignee(assignee) or assignee
+            # An unassigned root has no profile to snapshot at creation time;
+            # the explicit operator fallback supplies that missing identity.
+            if scope and not scope.get("allowed_assignees"):
+                scope["allowed_assignees"] = [fallback]
+                conn.execute(
+                    "UPDATE tasks SET assignee = ?, execution_scope = ? WHERE id = ?",
+                    (fallback, json.dumps(scope, ensure_ascii=False, sort_keys=True), task_id),
+                )
+            elif scope and fallback not in scope.get("allowed_assignees", ()):
+                # An explicit scope is an authority fence. Never rewrite an
+                # unassigned card to an operator fallback outside that fence.
+                return False
+            else:
+                cur = conn.execute(
+                    "UPDATE tasks SET assignee = ? WHERE id = ? "
+                    "AND (assignee IS NULL OR assignee = '')",
+                    (fallback, task_id),
+                )
+                if cur.rowcount != 1:
+                    return False
             _kb._append_event(
                 conn, task_id, "assigned",
                 {"assignee": assignee, "source": "kanban.default_assignee"},
@@ -1638,12 +1802,13 @@ def _run_reclaim_phase(
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, failure_limit=failure_limit)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
-    result.timed_out = enforce_max_runtime(conn)
+    result.result_unknown.extend(getattr(detect_crashed_workers, "_last_result_unknown", []))
+    result.timed_out = enforce_max_runtime(conn, failure_limit=failure_limit)
     result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 

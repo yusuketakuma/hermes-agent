@@ -25,7 +25,10 @@ def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     with kbc.connect() as conn:
-        task_id = kb.create_task(conn, title="Review tool contract", assignee="builder")
+        task_id = kb.create_task(
+            conn, title="Review tool contract", assignee="builder",
+            execution_scope={"allowed_assignees": ["builder", "reviewer"]},
+        )
         task = kb.claim_task(conn, task_id, claimer="builder:1")
         assert task is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
@@ -133,7 +136,10 @@ def test_review_cli_round_trip_preserves_handoff(
     kb.init_db()
 
     with kbc.connect() as conn:
-        task_id = kb.create_task(conn, title="CLI review", assignee="builder")
+        task_id = kb.create_task(
+            conn, title="CLI review", assignee="builder",
+            execution_scope={"allowed_assignees": ["builder", "reviewer"]},
+        )
         implementation = kb.claim_task(conn, task_id, claimer="builder:1")
         assert implementation is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)

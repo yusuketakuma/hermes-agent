@@ -314,6 +314,7 @@ class NonChunkingAdapter:
 async def test_long_output_truncated_for_non_chunking_adapter(tmp_path, monkeypatch):
     """Non-chunking adapters receive truncated content with a footer + file save."""
     monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr("tools.send_message_tool._authorize_discord_channel_target", lambda *_args: None)
     adapter = NonChunkingAdapter()
     router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
     target = DeliveryTarget.parse("discord:123")
@@ -329,6 +330,23 @@ async def test_long_output_truncated_for_non_chunking_adapter(tmp_path, monkeypa
     saved_files = list(tmp_path.glob("cron/output/job1_*.txt"))
     assert len(saved_files) == 1
     assert saved_files[0].read_text() == long_content
+
+
+@pytest.mark.asyncio
+async def test_delivery_transport_refuses_unlisted_discord_target(monkeypatch):
+    adapter = RecordingAdapter()
+    monkeypatch.setattr(
+        "tools.send_message_tool._authorize_discord_channel_target",
+        lambda *_args: "target denied",
+    )
+    router = DeliveryRouter(GatewayConfig(), adapters={Platform.DISCORD: adapter})
+
+    with pytest.raises(RuntimeError, match="target denied"):
+        await router._deliver_to_platform(
+            DeliveryTarget.parse("discord:unlisted"), "hello", metadata=None,
+        )
+
+    assert adapter.calls == []
 
 
 def _simulate_windows_codepage_write(monkeypatch):

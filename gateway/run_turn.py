@@ -181,12 +181,28 @@ class GatewayTurnMixin:
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(
+        self, user_message: str, model: str, runtime_kwargs: dict, *, turn_policy: Optional[dict] = None,
+    ) -> dict:
         """Effective model/runtime config for one turn. With `/fast` priority on, fast-mode
         ``request_overrides`` are deep-merged OVER the per-provider ones so both reach the model."""
-        from gateway.run import _deep_merge_request_overrides
+        from gateway.run import _deep_merge_request_overrides, _resolve_runtime_agent_kwargs_for_provider
         from hermes_cli.models import resolve_fast_mode_overrides
         # Tests bind this method onto bare namespaces, so no class-level tables here.
+        local_policy = turn_policy if isinstance(turn_policy, dict) and turn_policy.get("route") == "local" else None
+        if local_policy is not None:
+            provider = str(local_policy.get("provider") or "").strip()
+            model = str(local_policy.get("model") or "").strip()
+            toolsets = local_policy.get("enabled_toolsets")
+            if not provider.startswith("custom:") or not model:
+                raise ValueError("local turn route requires a named custom provider and model")
+            if toolsets != ["bot_conversation"]:
+                raise ValueError("local turn route requires the bot_conversation toolset only")
+            local_runtime = _resolve_runtime_agent_kwargs_for_provider(provider)
+            local_host = base_url_hostname(str(local_runtime.get("base_url") or "")).lower().rstrip(".")
+            if local_host not in {"localhost", "127.0.0.1", "::1"}:
+                raise ValueError("local turn route must use a loopback endpoint")
+            runtime_kwargs = local_runtime
         runtime = {
             k: runtime_kwargs.get(k) for k in (
                 "api_key", "base_url", "provider", "requested_provider", "api_mode", "command", "args",
@@ -204,6 +220,10 @@ class GatewayTurnMixin:
                 runtime["api_mode"], runtime["command"], tuple(runtime["args"]),
             ),
         }
+        if local_policy is not None:
+            route["enabled_toolsets"] = list(local_policy["enabled_toolsets"])
+            route["allow_fallback"] = False
+            route["persist_model"] = False
         if getattr(self, "_service_tier", None) != "priority":
             # None / auto / cold: the bounded window is applied per request by agent.fast_mode.
             route["request_overrides"] = base_request_overrides
@@ -1215,10 +1235,15 @@ class GatewayTurnMixin:
 
     async def _hmwa_run_session_hygiene(
         self, event, source, session_entry, session_key, history, _quick_key, run_generation,
+        turn_policy: Optional[dict] = None,
     ):
         """Auto-compress pathologically large transcripts before the agent starts so oversized
         histories don't cause repeated truncation/context failures. Token source: the API's
         prompt_tokens from the last turn, else a char/4 estimate."""
+        if isinstance(turn_policy, dict) and turn_policy.get("route") == "local":
+            # Local CHAT/INFO must not construct or resolve the normal-provider compression agent.
+            logger.info("Session hygiene skipped for local-only turn %s", session_key or "?")
+            return history
         from gateway.run import HygieneTurnHoldExceeded
         if not history or len(history) < 4:
             return history
@@ -1921,6 +1946,10 @@ class GatewayTurnMixin:
             history = await self.async_session_store.load_transcript(session_entry.session_id)
             history = await self._hmwa_run_session_hygiene(
                 event, source, session_entry, session_key, history, _quick_key, run_generation,
+                turn_policy=(
+                    (getattr(event, "metadata", {}) or {}).get("turn_policy")
+                    if isinstance(getattr(event, "metadata", {}), dict) else None
+                ),
             )
         except TranscriptReadError:
             self._clear_session_env(_session_env_tokens)
@@ -2024,6 +2053,10 @@ class GatewayTurnMixin:
                 persist_user_timestamp=prepared.persist_user_timestamp,
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 persist_user_display_metadata={"gateway_input_owner": prepared.persistence_owner},
+                turn_policy=(
+                    (getattr(event, "metadata", {}) or {}).get("turn_policy")
+                    if isinstance(getattr(event, "metadata", {}), dict) else None
+                ),
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
@@ -2561,14 +2594,14 @@ class GatewayTurnMixin:
         _stream_consumer = self._proxy_stream_consumer(source, event_message_id, _thread_metadata, _run_still_current)
         stream_task = asyncio.create_task(_stream_consumer.run()) if _stream_consumer else None
 
-        _adapter = self._adapter_for_source(source)
-        if _adapter:
-            with suppress(Exception):
-                await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
-
         full_response = ""
         _start = time.time()
         try:
+            _adapter = self._adapter_for_source(source)
+            if _adapter:
+                with suppress(Exception):
+                    await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
+
             _timeout = ClientTimeout(total=0, sock_read=1800)
             async with _AioClientSession(timeout=_timeout) as session:
                 async with session.post(f"{proxy_url}/v1/chat/completions", json=body, headers=headers) as resp:
@@ -2609,13 +2642,12 @@ class GatewayTurnMixin:
                 return self._proxy_error_result(f"⚠️ Proxy connection error: {e}")
             # Partial response — return what we got
         finally:
-            if _stream_consumer:
-                _stream_consumer.finish()
-            if stream_task:
-                try:
-                    await asyncio.wait_for(stream_task, timeout=5.0)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    stream_task.cancel()
+            try:
+                if _stream_consumer:
+                    _stream_consumer.finish()
+            finally:
+                if stream_task:
+                    await self._await_stream_task(stream_task)
 
         _elapsed = time.time() - _start
         if not _run_still_current():
@@ -2809,6 +2841,9 @@ class GatewayTurnMixin:
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
             **{name: getattr(disp, name) for name in self._DISPLAY_TO_TURN_CTX}, **turn_params,
         )
+        if isinstance(turn_ctx.turn_policy, dict) and turn_ctx.turn_policy.get("route") == "local":
+            turn_ctx.enabled_toolsets = list(turn_ctx.turn_policy.get("enabled_toolsets") or [])
+            turn_ctx.disabled_toolsets = None
         turn_runner = TurnRunner(self, turn_ctx)
         # Agent tool-lifecycle callbacks live on the runner (bound methods, same signatures).
         turn_ctx.progress_callback = turn_runner.progress_callback
@@ -2992,10 +3027,16 @@ class GatewayTurnMixin:
         """Give the stream consumer task 5s to flush, then cancel it."""
         try:
             await asyncio.wait_for(stream_task, timeout=5.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except asyncio.TimeoutError:
             stream_task.cancel()
-            with suppress(asyncio.CancelledError):
-                await stream_task
+            await asyncio.gather(stream_task, return_exceptions=True)
+        except asyncio.CancelledError:
+            stream_task.cancel()
+            await asyncio.gather(stream_task, return_exceptions=True)
+        finally:
+            # The child may absorb cancellation or replace it with a normal exception.
+            if asyncio.current_task().cancelling():
+                raise asyncio.CancelledError
 
     async def _run_agent_track_agent(self, turn_ctx: TurnContext) -> None:
         """Track this agent as running for the session (interrupt support) once it is created — only
@@ -3019,14 +3060,51 @@ class GatewayTurnMixin:
         self, adapter: Any, agent: Any, source: SessionSource, session_key: str,
         _interrupt_detected: "asyncio.Event", streaming_tts_consumer_holder: list, *,
         log_context: str, log: Callable[[], None],
-    ) -> None:
+    ) -> bool:
         """Peek the adapter's pending event, transcribe voice, then signal the agent + abort streaming TTS.
 
         Peek WITHOUT consuming: the event must stay for the post-run ``_dequeue_pending_event()``
         (popping races the agent finishing). Transcribe BEFORE signaling so voice interrupts carry
-        the real transcript."""
+        the real transcript. Return False when the pending event is not compatible with this turn."""
         from gateway.run import _build_media_placeholder
-        _peek_event = adapter._pending_messages.get(session_key)
+
+        if _interrupt_detected.is_set():
+            return False
+        _pending_messages = getattr(adapter, "_pending_messages", None)
+        if not isinstance(_pending_messages, dict):
+            return False
+        _peek_event = _pending_messages.get(session_key)
+
+        def _compatible(event: Any) -> bool:
+            if event is None or _interrupt_detected.is_set():
+                return False
+            metadata = getattr(event, "metadata", None)
+            if isinstance(metadata, dict):
+                raw_policy = metadata.get("turn_policy")
+                if raw_policy is not None and not isinstance(raw_policy, dict):
+                    return False
+            candidate_detector = getattr(self, "_hm_bot_conversation_candidate", None)
+            if callable(candidate_detector):
+                try:
+                    is_bot_candidate = bool(candidate_detector(event))
+                except Exception:
+                    return False
+                if is_bot_candidate and (
+                    not getattr(event, "_gateway_dispatch_classified", False)
+                    or not isinstance(metadata, dict)
+                    or metadata.get("_bot_conversation_route_checked") is not True
+                ):
+                    return False
+            matcher = getattr(self, "_busy_turn_policy_matches", None)
+            if not callable(matcher):
+                return False
+            try:
+                return bool(matcher(event, agent))
+            except Exception:
+                return False
+
+        if not _compatible(_peek_event):
+            return False
         pending_text = None
         if _peek_event is not None:
             pending_text = _peek_event.text or ""
@@ -3037,6 +3115,14 @@ class GatewayTurnMixin:
                 )
             elif not pending_text and (getattr(_peek_event, "media_urls", None) or []):
                 pending_text = _build_media_placeholder(_peek_event)
+        if (
+            _interrupt_detected.is_set()
+            or getattr(adapter, "_pending_messages", None) is not _pending_messages
+            or _pending_messages.get(session_key) is not _peek_event
+        ):
+            return False
+        if not _compatible(_peek_event):
+            return False
         log()
         agent.interrupt(pending_text)
         _interrupt_detected.set()
@@ -3052,6 +3138,7 @@ class GatewayTurnMixin:
         _stts = streaming_tts_consumer_holder[0]
         if _stts is not None:
             _stts.abort("barge-in")
+        return True
 
     async def _run_agent_monitor_for_interrupt(self, turn_ctx: TurnContext, _interrupt_detected: "asyncio.Event") -> None:
         """Poll the adapter for interrupts (new messages) every 200ms and signal the agent.
@@ -3072,12 +3159,13 @@ class GatewayTurnMixin:
                 if hasattr(_adapter, 'has_pending_interrupt') and _adapter.has_pending_interrupt(session_key):
                     agent = agent_holder[0]
                     if agent:
-                        await self._run_agent_fire_pending_interrupt(
+                        interrupted = await self._run_agent_fire_pending_interrupt(
                             _adapter, agent, source, session_key, _interrupt_detected,
                             streaming_tts_consumer_holder, log_context="Voice-interrupt",
                             log=lambda: logger.debug("Interrupt detected from adapter, signaling agent..."),
                         )
-                        break
+                        if interrupted or _interrupt_detected.is_set():
+                            break
             except asyncio.CancelledError:
                 raise
             except Exception as _mon_err:
@@ -3363,12 +3451,24 @@ class GatewayTurnMixin:
         )
         pending_event = None
         pending = None
+        pending_event_route_rejected = False
         if result and adapter and session_key:
             pending_event = _dequeue_pending_event(adapter, session_key)
             # /queue overflow: promote the next queued event into the consumed "next-up" slot so the
             # recursive drain sees it (keeps FIFO order; a mid-chain /queue can't jump the queue).
             pending_event = self._promote_queued_event(session_key, adapter, pending_event)
-            if result.get("interrupted") and not pending_event and result.get("interrupt_message"):
+            if (
+                pending_event is not None
+                and not getattr(pending_event, "internal", False)
+                and not getattr(pending_event, "_gateway_dispatch_classified", False)
+            ):
+                pending_event = self._hm_pre_gateway_dispatch_hook(
+                    pending_event, getattr(pending_event, "source", source) or source,
+                )
+                pending_event_route_rejected = pending_event is None
+            if pending_event_route_rejected:
+                pending = None
+            elif result.get("interrupted") and not pending_event and result.get("interrupt_message"):
                 interrupt_message = result.get("interrupt_message")
                 if _is_control_interrupt_message(interrupt_message):
                     logger.info(
@@ -3474,7 +3574,6 @@ class GatewayTurnMixin:
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
-        from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
@@ -3498,10 +3597,19 @@ class GatewayTurnMixin:
             )
             adapter = self._adapter_for_source(source)
             if adapter and pending_event:
-                merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                self._queue_or_replace_pending_event(session_key, pending_event)
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
+
+        # Drain the parent's stream before the child; do not replay a handled error in cleanup.
+        if stream_task and turn_ctx.stream_consumer_holder[0] is not None:
+            try:
+                await self._await_stream_task(stream_task)
+            except Exception as exc:
+                logger.debug("Parent stream wait before queued follow-up failed: %s", exc)
+            turn_ctx.stream_task_drained = stream_task.done()
+            stream_task = None
 
         # Interrupted: discard the response ("Operation interrupted." is noise).
         if not result.get("interrupted"):
@@ -3510,7 +3618,7 @@ class GatewayTurnMixin:
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
         # message_type is carried into the recursive call so queued voice turns can stream TTS.
-        next_message_id = next_channel_prompt = next_message_type = None
+        next_message_id = next_channel_prompt = next_message_type = next_turn_policy = None
         # The raw inbound id keys the delivery-ledger obligation for the follow-up's own final send,
         # distinct from the reply anchor above (None in forum topics). Carry it or two chained
         # topic turns with the same text would collide on one obligation id (queued-final-ledger).
@@ -3542,6 +3650,12 @@ class GatewayTurnMixin:
             next_inbound_id = str(pending_event.message_id) if getattr(pending_event, "message_id", None) else None
             next_channel_prompt = getattr(pending_event, "channel_prompt", None)
             next_message_type = getattr(pending_event, "message_type", None)
+            next_metadata = getattr(pending_event, "metadata", None)
+            next_turn_policy = (
+                next_metadata.get("turn_policy") if isinstance(next_metadata, dict) else None
+            )
+        else:
+            next_turn_policy = getattr(turn_ctx, "turn_policy", None)
 
         # Clear the prior turn's streaming-TTS completion marker so the recursive turn isn't suppressed.
         # See #60671.
@@ -3576,7 +3690,8 @@ class GatewayTurnMixin:
             source=next_source, session_id=session_id, session_key=next_session_key,
             run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
             event_message_id=next_message_id, inbound_message_id=next_inbound_id,
-            channel_prompt=next_channel_prompt, message_type=next_message_type,
+            channel_prompt=next_channel_prompt, turn_policy=next_turn_policy,
+            message_type=next_message_type,
         )
         merged = _preserve_queued_followup_history_offset(result, followup_result)
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
@@ -3595,26 +3710,41 @@ class GatewayTurnMixin:
     ) -> None:
         """``finally`` half of a turn: cancel background tasks, flush stream, release the session slot."""
         stream_consumer_holder, session_key = turn_ctx.stream_consumer_holder, turn_ctx.session_key
+        _cancel_requested = bool(asyncio.current_task().cancelling())
+
+        async def _await_cleanup(awaitable):
+            nonlocal _cancel_requested
+            try:
+                return await awaitable
+            except asyncio.CancelledError:
+                return None
+            finally:
+                _cancel_requested = _cancel_requested or bool(asyncio.current_task().cancelling())
+
         for task in (progress_task, log_task, interrupt_monitor, _notify_task):
             if task:
                 task.cancel()
 
-        if stream_task:
-            # No stream consumer was created: nothing to flush, cancel instead of waiting out 5s.
-            if not (stream_consumer_holder and stream_consumer_holder[0] is not None):
-                stream_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await stream_task
-            else:
-                await self._await_stream_task(stream_task)
+        _stream_error = None
+        try:
+            if stream_task and not getattr(turn_ctx, "stream_task_drained", False):
+                # No stream consumer was created: nothing to flush, cancel instead of waiting out 5s.
+                if not (stream_consumer_holder and stream_consumer_holder[0] is not None):
+                    stream_task.cancel()
+                    await _await_cleanup(asyncio.gather(stream_task, return_exceptions=True))
+                else:
+                    await _await_cleanup(self._await_stream_task(stream_task))
+        except Exception as exc:
+            _stream_error = exc
 
         # Abort + bounded wait for streaming TTS: covers paths where normal finalisation was skipped.
         _stts_finally = turn_ctx.streaming_tts_consumer_holder[0]
         # See #60671.
         if _stts_finally is not None and not _stts_finally.done:
-            _stts_finally.abort("cleanup")
             with suppress(Exception):
-                await _stts_finally.wait_complete(timeout=2.0)
+                _stts_finally.abort("cleanup")
+            with suppress(Exception):
+                await _await_cleanup(_stts_finally.wait_complete(timeout=2.0))
 
         tracking_task.cancel()
         if session_key:
@@ -3624,15 +3754,23 @@ class GatewayTurnMixin:
         if self._draining:
             self._update_runtime_status("draining")
 
-        for task in (progress_task, log_task, interrupt_monitor, tracking_task, _notify_task):
-            if task:
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    # A background task that died of a real error must not abort the cleanup path.
-                    logger.debug("background turn task failed during cleanup", exc_info=True)
+        _background_tasks = [
+            task for task in (progress_task, log_task, interrupt_monitor, tracking_task, _notify_task) if task
+        ]
+        if _background_tasks:
+            _background_results = await _await_cleanup(
+                asyncio.gather(*_background_tasks, return_exceptions=True)
+            )
+            if _background_results is not None:
+                for _background_result in _background_results:
+                    if isinstance(_background_result, Exception):
+                        # A background task that died of a real error must not abort the cleanup path.
+                        logger.debug("background turn task failed during cleanup: %s", _background_result)
+
+        if _cancel_requested:
+            raise asyncio.CancelledError
+        if _stream_error is not None:
+            raise _stream_error
 
     async def _run_agent_edit_streamed_message(
         self, _sc, source, response, content, *, _sk, ok, fail_result, fail_exc,
@@ -3874,11 +4012,13 @@ class GatewayTurnMixin:
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
         persist_user_display_metadata: Optional[dict] = None,
+        turn_policy: Optional[dict] = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
-        if self._get_proxy_url():
+        _local_turn = isinstance(turn_policy, dict) and turn_policy.get("route") == "local"
+        if self._get_proxy_url() and not _local_turn:
             return await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
@@ -3898,6 +4038,7 @@ class GatewayTurnMixin:
             persist_user_timestamp=persist_user_timestamp,
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
+            turn_policy=turn_policy,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
@@ -3924,6 +4065,9 @@ class GatewayTurnMixin:
             worker = self._run_agent_start_turn_worker(turn_ctx, turn_runner.run_sync)
             _executor_task_holder[0] = worker.executor_task  # read late by _notify_long_running
             response = await self._run_agent_await_turn_worker(worker, turn_ctx, _interrupt_detected, interrupt_monitor)
+            # This monitor belongs to the completed worker, not its queued follow-up.
+            interrupt_monitor.cancel()
+            await asyncio.gather(interrupt_monitor, return_exceptions=True)
             self._run_agent_evict_on_fallback(turn_ctx)
 
             # Interrupted OR queued message (/queue)?

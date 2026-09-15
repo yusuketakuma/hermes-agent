@@ -3,7 +3,11 @@
 Verifies that users get an immediate status response instead of total silence
 when the agent is working on a task. See PR fix for the @Lonely__MH report.
 """
+import asyncio
 import time
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -90,12 +94,114 @@ def _make_adapter(platform_val="telegram"):
     return adapter
 
 
+def _load_bot_conversation_plugin():
+    plugin_path = Path(__file__).resolve().parents[3] / "plugins" / "bot-conversation" / "__init__.py"
+    spec = importlib.util.spec_from_file_location("bot_conversation_gateway_test_plugin", plugin_path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
 class TestBusySessionAck:
     """User sends a message while agent is running — should get acknowledgment."""
+
+
+    def test_pre_dispatch_skip_has_priority_over_allow(self, monkeypatch):
+        runner, _sentinel = _make_runner()
+        event = _make_event()
+
+        monkeypatch.setattr(
+            "hermes_cli.lifecycle.invoke_hook",
+            lambda *_args, **_kwargs: [{"action": "allow"}, {"action": "skip", "reason": "blocked"}],
+        )
+
+        assert runner._hm_pre_gateway_dispatch_hook(event, event.source) is None
+
+
+    def test_bot_chat_hook_failure_fails_closed(self, monkeypatch):
+        runner, _sentinel = _make_runner()
+        event = _make_event(text="種別=CHAT\n要約=hello", chat_id="1548242914268807228", platform_val="discord")
+        event.source.is_bot = True
+
+        def fail(*_args, **_kwargs):
+            raise RuntimeError("hook unavailable")
+
+        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", fail)
+
+        assert runner._hm_pre_gateway_dispatch_hook(event, event.source) is None
+
+
+    def test_unregistered_bot_chat_route_fails_closed(self, monkeypatch):
+        runner, _sentinel = _make_runner()
+        event = _make_event(text="種別=CHAT\n要約=hello", chat_id="1548242914268807228", platform_val="discord")
+        event.source.is_bot = True
+        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_args, **_kwargs: [])
+
+        assert runner._hm_pre_gateway_dispatch_hook(event, event.source) is None
+
+
+    @pytest.mark.parametrize(
+        "before,after_text",
+        [
+            ("CHAT", "種別=TASK_PROPOSAL\n要約=rewritten"),
+            ("TASK_PROPOSAL", "種別=CHAT\n要約=rewritten"),
+            ("TASK_PROPOSAL", "🧭 種別=TASK_PROPOSAL\n種別=CHAT\n要約=rewritten"),
+            ("CHAT", "🧭 種別=CHAT\n種別=TASK_PROPOSAL\n要約=rewritten"),
+        ],
+    )
+    def test_routing_relevant_rewrite_is_rejected(self, monkeypatch, before, after_text):
+        runner, _sentinel = _make_runner()
+        event = _make_event(
+            text=f"種別={before}\n要約=hello", chat_id="1548242914268807228", platform_val="discord",
+        )
+        event.source.is_bot = True
+        plugin = _load_bot_conversation_plugin()
+        monkeypatch.setattr(
+            plugin, "_config", lambda: {"channel_id": "1548242914268807228"}
+        )
+        monkeypatch.setattr(
+            "hermes_cli.lifecycle.invoke_hook",
+            lambda name, **kwargs: [
+                plugin._on_pre_gateway_dispatch(**kwargs),
+                {"action": "rewrite", "text": after_text},
+            ] if name == "pre_gateway_dispatch" else [],
+        )
+
+        assert runner._hm_pre_gateway_dispatch_hook(event, event.source) is None
+        assert event.metadata["_bot_conversation_route_checked"] is True
+
+
+    @pytest.mark.asyncio
+    async def test_pending_slot_keeps_formal_and_local_routes_separate(self):
+        runner, sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+        source = SessionSource(
+            platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", user_id="user1",
+        )
+        sk = build_session_key(source)
+        runner.adapters[source.platform] = adapter
+        runner._running_agents[sk] = sentinel
+
+        local = MessageEvent(
+            text="local", source=source, message_id="local", metadata={
+                "turn_policy": {"route": "local", "enabled_toolsets": ["bot_conversation"]},
+            },
+        )
+        local._gateway_dispatch_classified = True
+        formal = MessageEvent(text="formal", source=source, message_id="formal", metadata={})
+        formal._gateway_dispatch_classified = True
+
+        await runner._handle_active_session_busy_message(local, sk)
+        await runner._handle_active_session_busy_message(formal, sk)
+
+        assert adapter._pending_messages[sk] is local
+        assert [event.text for event in runner._queued_events[sk]] == ["formal"]
 
 
     @pytest.mark.asyncio
@@ -226,6 +332,581 @@ class TestBusySessionAck:
         content = call_kwargs.kwargs.get("content") or call_kwargs[1].get("content", "")
         assert "Steered" in content or "steer" in content.lower()
         assert "Interrupting" not in content
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("running_policy,incoming_policy", [
+        (None, {"route": "local", "provider": "custom:mac-mini-ollama", "model": "hermes-fallback:latest", "enabled_toolsets": ["bot_conversation"]}),
+        ({"route": "local", "provider": "custom:mac-mini-ollama", "model": "hermes-fallback:latest", "enabled_toolsets": ["bot_conversation"]}, None),
+    ])
+    async def test_busy_route_change_is_queued_without_steer_or_interrupt(
+        self, running_policy, incoming_policy, monkeypatch,
+    ):
+        import gateway.run as _gr
+
+        monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "steer"
+        adapter = _make_adapter()
+        event = _make_event(text="change route")
+        event.metadata = {"turn_policy": incoming_policy} if incoming_policy else {}
+        sk = build_session_key(event.source)
+        runner.adapters[event.source.platform] = adapter
+
+        agent = MagicMock()
+        agent._gateway_turn_policy = running_policy
+        agent.steer.return_value = True
+        runner._running_agents[sk] = agent
+
+        await runner._handle_active_session_busy_message(event, sk)
+
+        assert adapter._pending_messages[sk] is event
+        agent.steer.assert_not_called()
+        agent.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pending_interrupt_rejects_mismatched_turn_policy(self):
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter()
+        event = _make_event(text="formal follow-up")
+        event.metadata = {"turn_policy": {"route": "formal"}}
+        sk = build_session_key(event.source)
+        adapter._pending_messages[sk] = event
+
+        agent = MagicMock()
+        agent._gateway_turn_policy = {"route": "local"}
+        detected = asyncio.Event()
+        log = MagicMock()
+
+        interrupted = await runner._run_agent_fire_pending_interrupt(
+            adapter, agent, event.source, sk, detected, [None], log_context="test", log=log,
+        )
+
+        assert interrupted is False
+        assert adapter._pending_messages[sk] is event
+        agent.interrupt.assert_not_called()
+        assert not detected.is_set()
+        log.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pending_interrupt_handles_compatible_event(self):
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter()
+        event = _make_event(text="same route")
+        sk = build_session_key(event.source)
+        adapter._pending_messages[sk] = event
+
+        agent = MagicMock()
+        agent._gateway_turn_policy = None
+        detected = asyncio.Event()
+        log = MagicMock()
+
+        interrupted = await runner._run_agent_fire_pending_interrupt(
+            adapter, agent, event.source, sk, detected, [None], log_context="test", log=log,
+        )
+
+        assert interrupted is True
+        agent.interrupt.assert_called_once_with("same route")
+        assert detected.is_set()
+        log.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_pending_bot_interrupt_requires_dispatch_attestation(self):
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter(platform_val="discord")
+        event = _make_event(
+            text="種別=CHAT\n要約=hello", chat_id="1548242914268807228", platform_val="discord",
+        )
+        event.source.is_bot = True
+        event.metadata = {}
+        sk = build_session_key(event.source)
+        adapter._pending_messages[sk] = event
+
+        agent = MagicMock()
+        agent._gateway_turn_policy = None
+        detected = asyncio.Event()
+
+        interrupted = await runner._run_agent_fire_pending_interrupt(
+            adapter, agent, event.source, sk, detected, [None], log_context="test", log=MagicMock(),
+        )
+
+        assert interrupted is False
+        assert adapter._pending_messages[sk] is event
+        agent.interrupt.assert_not_called()
+        assert not detected.is_set()
+
+    @pytest.mark.asyncio
+    async def test_interrupt_monitor_retries_after_rejected_pending_event(self, monkeypatch):
+        runner, _sentinel = _make_runner()
+        adapter = _make_adapter()
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+        sk = build_session_key(source)
+        runner._adapter_for_source = lambda _source: adapter
+        adapter.has_pending_interrupt = MagicMock(return_value=True)
+        runner._run_agent_fire_pending_interrupt = AsyncMock(side_effect=[False, True])
+        sleep_calls = []
+
+        async def no_sleep(_delay):
+            sleep_calls.append(_delay)
+
+        monkeypatch.setattr("gateway.run_turn.asyncio.sleep", no_sleep)
+        turn_ctx = SimpleNamespace(
+            source=source, session_key=sk, agent_holder=[MagicMock()],
+            streaming_tts_consumer_holder=[None],
+        )
+
+        await runner._run_agent_monitor_for_interrupt(turn_ctx, asyncio.Event())
+
+        assert runner._run_agent_fire_pending_interrupt.await_count == 2
+        assert sleep_calls == [0.2, 0.2]
+
+    @pytest.mark.asyncio
+    async def test_completed_turn_stops_monitor_before_queued_followup(self, monkeypatch):
+        runner, _sentinel = _make_runner()
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+        turn_ctx = SimpleNamespace(
+            source=source, session_key=build_session_key(source), session_id="session-id",
+            run_generation=None, _interrupt_depth=0, history=[], context_prompt="",
+            _status_thread_metadata=None, event_message_id=None, inbound_message_id=None,
+            turn_policy=None, agent_holder=[MagicMock()], result_holder=[None],
+            stream_consumer_holder=[None], streaming_tts_consumer_holder=[None],
+        )
+        turn_runner = SimpleNamespace(run_sync=MagicMock())
+        display = SimpleNamespace(
+            needs_progress_queue=False, log_mode_enabled=False, _native_slack_task_cards=False,
+        )
+        monitor_started = asyncio.Event()
+        monitor_cancelled = asyncio.Event()
+
+        async def monitor(_ctx, _detected):
+            monitor_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                monitor_cancelled.set()
+                raise
+
+        async def await_worker(*_args):
+            await monitor_started.wait()
+            turn_ctx.result_holder[0] = {
+                "final_response": "parent", "messages": [], "interrupted": True,
+            }
+            return {"final_response": "parent"}
+
+        async def child_run(*_args, **_kwargs):
+            assert monitor_cancelled.is_set()
+            return {"final_response": "child", "messages": []}
+
+        async def noop(*_args, **_kwargs):
+            return None
+
+        runner._get_proxy_url = lambda: None
+        runner._run_agent_display_settings = lambda _source: display
+        runner._run_agent_build_turn_context = lambda *args, **kwargs: (turn_ctx, turn_runner, None)
+        runner._run_agent_bind_turn_wiring = lambda *args, **kwargs: None
+        runner._run_agent_start_streaming_tts = lambda *args, **kwargs: None
+        runner._run_agent_start_turn_worker = lambda *args, **kwargs: SimpleNamespace(executor_task=None)
+        runner._run_agent_await_turn_worker = await_worker
+        runner._run_agent_monitor_for_interrupt = monitor
+        runner._run_agent_finalize_streaming_tts = noop
+        runner._run_agent_drain_pending = AsyncMock(return_value=(None, "queued"))
+        runner._run_agent_evict_on_fallback = lambda _ctx: None
+        runner._run_agent_cleanup_turn_tasks = noop
+        runner._run_agent_stream_consumer_task = noop
+        runner._run_agent_track_agent = noop
+        runner._run_agent_notify_long_running = noop
+        runner._adapter_for_source = lambda _source: None
+        runner._refresh_agent_cache_message_count = noop
+        runner._run_agent = child_run
+
+        result = await runner._run_agent_inner(
+            message="parent", context_prompt="", history=[], source=source,
+            session_id="session-id", session_key=turn_ctx.session_key,
+        )
+
+        assert result["final_response"] == "child"
+        assert monitor_cancelled.is_set()
+
+    @pytest.mark.asyncio
+    async def test_parent_cancellation_during_monitor_shutdown_propagates(self):
+        runner, _sentinel = _make_runner()
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+        turn_ctx = SimpleNamespace(
+            source=source, session_key=build_session_key(source), session_id="session-id",
+            run_generation=None, _interrupt_depth=0, history=[], context_prompt="",
+            _status_thread_metadata=None, event_message_id=None, inbound_message_id=None,
+            turn_policy=None, agent_holder=[MagicMock()], result_holder=[None],
+            stream_consumer_holder=[None], streaming_tts_consumer_holder=[None],
+        )
+        turn_runner = SimpleNamespace(run_sync=MagicMock())
+        display = SimpleNamespace(
+            needs_progress_queue=False, log_mode_enabled=False, _native_slack_task_cards=False,
+        )
+        monitor_started = asyncio.Event()
+        monitor_cancelled = asyncio.Event()
+
+        async def monitor(_ctx, _detected):
+            monitor_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                monitor_cancelled.set()
+                raise
+
+        async def await_worker(*_args):
+            await monitor_started.wait()
+            turn_ctx.result_holder[0] = {
+                "final_response": "parent", "messages": [], "interrupted": True,
+            }
+            asyncio.get_running_loop().call_soon(asyncio.current_task().cancel)
+            return {"final_response": "parent"}
+
+        drain_pending = AsyncMock(return_value=(None, "queued"))
+        child_run = AsyncMock(return_value={"final_response": "child", "messages": []})
+
+        async def noop(*_args, **_kwargs):
+            return None
+
+        runner._get_proxy_url = lambda: None
+        runner._run_agent_display_settings = lambda _source: display
+        runner._run_agent_build_turn_context = lambda *args, **kwargs: (turn_ctx, turn_runner, None)
+        runner._run_agent_bind_turn_wiring = lambda *args, **kwargs: None
+        runner._run_agent_start_streaming_tts = lambda *args, **kwargs: None
+        runner._run_agent_start_turn_worker = lambda *args, **kwargs: SimpleNamespace(executor_task=None)
+        runner._run_agent_await_turn_worker = await_worker
+        runner._run_agent_monitor_for_interrupt = monitor
+        runner._run_agent_finalize_streaming_tts = noop
+        runner._run_agent_drain_pending = drain_pending
+        runner._run_agent_evict_on_fallback = lambda _ctx: None
+        runner._run_agent_cleanup_turn_tasks = noop
+        runner._run_agent_stream_consumer_task = noop
+        runner._run_agent_track_agent = noop
+        runner._run_agent_notify_long_running = noop
+        runner._adapter_for_source = lambda _source: None
+        runner._refresh_agent_cache_message_count = noop
+        runner._run_agent = child_run
+
+        with pytest.raises(asyncio.CancelledError):
+            await runner._run_agent_inner(
+                message="parent", context_prompt="", history=[], source=source,
+                session_id="session-id", session_key=turn_ctx.session_key,
+            )
+
+        assert monitor_cancelled.is_set()
+        drain_pending.assert_not_awaited()
+        child_run.assert_not_awaited()
+
+    @pytest.mark.parametrize("interrupted", [False, True])
+    @pytest.mark.asyncio
+    async def test_stream_error_does_not_replace_queued_child_result(self, interrupted):
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+        session_key = build_session_key(source)
+        stream_done = asyncio.Event()
+        consumer = SimpleNamespace(final_response_sent=False, final_content_delivered=False)
+        turn_ctx = SimpleNamespace(
+            source=source, session_key=session_key, session_id="session-id", run_generation=None,
+            _interrupt_depth=0, history=[], context_prompt="", _status_thread_metadata=None,
+            event_message_id=None, inbound_message_id=None, turn_policy=None,
+            agent_holder=[MagicMock()], result_holder=[None], stream_consumer_holder=[consumer],
+            streaming_tts_consumer_holder=[None], stream_task_drained=False,
+        )
+        display = SimpleNamespace(
+            needs_progress_queue=False, log_mode_enabled=False, _native_slack_task_cards=False,
+        )
+
+        async def idle(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        async def noop(*_args, **_kwargs):
+            return None
+
+        async def stream_consumer_task(*_args, **_kwargs):
+            await asyncio.sleep(0)
+            stream_done.set()
+            raise RuntimeError("parent stream error")
+
+        async def await_worker(*_args):
+            await asyncio.sleep(0)
+            turn_ctx.result_holder[0] = {
+                "final_response": "", "messages": [], "interrupted": interrupted,
+            }
+            return {"final_response": ""}
+
+        child_run = AsyncMock(return_value={"final_response": "child", "messages": []})
+        runner._get_proxy_url = lambda: None
+        runner._run_agent_display_settings = lambda _source: display
+        runner._run_agent_build_turn_context = lambda *args, **kwargs: (
+            turn_ctx, SimpleNamespace(run_sync=MagicMock()), None,
+        )
+        runner._run_agent_bind_turn_wiring = lambda *args, **kwargs: None
+        runner._run_agent_start_streaming_tts = lambda *args, **kwargs: None
+        runner._run_agent_start_turn_worker = lambda *args, **kwargs: SimpleNamespace(executor_task=None)
+        runner._run_agent_await_turn_worker = await_worker
+        runner._run_agent_monitor_for_interrupt = idle
+        runner._run_agent_stream_consumer_task = stream_consumer_task
+        runner._run_agent_track_agent = idle
+        runner._run_agent_notify_long_running = idle
+        runner._run_agent_finalize_streaming_tts = noop
+        runner._run_agent_drain_pending = AsyncMock(return_value=(None, "queued"))
+        runner._run_agent_evict_on_fallback = lambda _ctx: None
+        runner._adapter_for_source = lambda _source: None
+        runner._refresh_agent_cache_message_count = noop
+        runner._run_agent = child_run
+        runner._release_running_agent_state = MagicMock()
+
+        result = await GatewayRunner._run_agent_inner(
+            runner, message="parent", context_prompt="", history=[], source=source,
+            session_id="session-id", session_key=session_key,
+        )
+
+        assert result["final_response"] == "child"
+        assert stream_done.is_set()
+        assert turn_ctx.stream_task_drained is True
+        child_run.assert_awaited_once()
+        runner._release_running_agent_state.assert_called_once_with(session_key, run_generation=None)
+
+    @pytest.mark.asyncio
+    async def test_stream_task_wait_preserves_parent_cancellation(self):
+        from gateway.run import GatewayRunner
+
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def stream():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        stream_task = asyncio.create_task(stream())
+        parent = asyncio.current_task()
+
+        async def cancel_parent():
+            await started.wait()
+            parent.cancel()
+
+        asyncio.create_task(cancel_parent())
+        with pytest.raises(asyncio.CancelledError):
+            await GatewayRunner._await_stream_task(stream_task)
+
+        assert cancelled.is_set()
+
+    @pytest.mark.asyncio
+    async def test_stream_task_wait_preserves_cancellation_when_child_absorbs_it(self):
+        from gateway.run import GatewayRunner
+
+        started = asyncio.Event()
+
+        async def stream():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return
+
+        stream_task = asyncio.create_task(stream())
+        parent = asyncio.current_task()
+
+        async def cancel_parent():
+            await started.wait()
+            parent.cancel()
+
+        asyncio.create_task(cancel_parent())
+        with pytest.raises(asyncio.CancelledError):
+            await GatewayRunner._await_stream_task(stream_task)
+
+    @pytest.mark.asyncio
+    async def test_proxy_typing_cancellation_finishes_stream_task(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://127.0.0.1:8642")
+        runner, _sentinel = _make_runner()
+        source = SessionSource(platform=Platform.MATRIX, chat_id="room", chat_type="group")
+        typing_started = asyncio.Event()
+        stream_finished = asyncio.Event()
+
+        class Consumer:
+            def __init__(self):
+                self.task = None
+                self.finish = MagicMock(side_effect=stream_finished.set)
+
+            async def run(self):
+                self.task = asyncio.current_task()
+                await asyncio.Event().wait()
+
+        consumer = Consumer()
+
+        async def send_typing(*_args, **_kwargs):
+            typing_started.set()
+            await asyncio.Event().wait()
+
+        runner._proxy_stream_consumer = lambda *_args: consumer
+        runner._adapter_for_source = lambda _source: SimpleNamespace(send_typing=send_typing)
+        runner._thread_metadata_for_source = lambda *_args: None
+        runner._run_still_current_fn = lambda *_args: lambda: True
+        parent = asyncio.current_task()
+
+        async def cancel_parent():
+            await typing_started.wait()
+            parent.cancel()
+
+        canceller = asyncio.create_task(cancel_parent())
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await runner._run_agent_via_proxy(
+                    message="hello", context_prompt="", history=[], source=source, session_id="session",
+                )
+        finally:
+            await asyncio.gather(canceller, return_exceptions=True)
+
+        assert stream_finished.is_set()
+        assert consumer.task is not None and consumer.task.done()
+
+    @pytest.mark.asyncio
+    async def test_outer_finalizer_releases_slot_and_lease_when_durable_clear_is_cancelled(self):
+        from gateway.run import GatewayRunner
+
+        runner, sentinel = _make_runner()
+        event = _make_event()
+        source = event.source
+        session_key = "session-key"
+        state = SimpleNamespace(turn=SimpleNamespace(lease=None))
+
+        runner._hm_admit_event = AsyncMock(return_value=(event, source, False))
+        runner._hm_estop_gate = MagicMock(return_value=None)
+        runner._session_key_for_source = MagicMock(return_value=session_key)
+        runner._hm_pending_reply_intercepts = AsyncMock(return_value=None)
+        runner._hm_evict_idle_stale_agent = MagicMock()
+        runner._is_session_running = MagicMock(return_value=False)
+        runner._hm_dispatch_idle_commands = AsyncMock(return_value=(False, None))
+        runner._is_telegram_topic_root_lobby = MagicMock(return_value=False)
+        runner._external_drain_active = False
+        runner._claim_active_session_slot = MagicMock(return_value=(None, None))
+        runner._hm_rescue_orphaned_fifo = lambda *_args: (event, source, False)
+        runner._session_state = MagicMock(return_value=state)
+        runner._persist_active_agents = MagicMock()
+        runner._begin_session_run_generation = MagicMock(return_value=7)
+        runner._handle_message_with_agent = AsyncMock(return_value="ok")
+        runner._run_post_turn_hooks = AsyncMock()
+        runner._restore_pending_one_turn_model_override = MagicMock()
+        runner._clear_durable_active_turn = AsyncMock(side_effect=asyncio.CancelledError)
+        runner._release_running_agent_state = MagicMock()
+        runner._release_turn_lease = MagicMock()
+
+        with pytest.raises(asyncio.CancelledError):
+            await GatewayRunner._handle_message(runner, event)
+
+        assert state.turn.agent is sentinel
+        runner._release_running_agent_state.assert_called_once_with(session_key, run_generation=7)
+        runner._release_turn_lease.assert_called_once_with(session_key, 7)
+
+    @pytest.mark.asyncio
+    async def test_cleanup_releases_session_slot_after_stream_error(self):
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+        session_key = build_session_key(source)
+
+        async def stream():
+            raise RuntimeError("stream failed")
+
+        stream_task = asyncio.create_task(stream())
+        tracking_task = asyncio.create_task(asyncio.sleep(3600))
+        runner._release_running_agent_state = MagicMock()
+        turn_ctx = SimpleNamespace(
+            stream_consumer_holder=[object()], session_key=session_key,
+            run_generation=None, streaming_tts_consumer_holder=[None],
+        )
+
+        with pytest.raises(RuntimeError, match="stream failed"):
+            await GatewayRunner._run_agent_cleanup_turn_tasks(
+                runner, turn_ctx, progress_task=None, log_task=None,
+                interrupt_monitor=None, _notify_task=None,
+                tracking_task=tracking_task, stream_task=stream_task,
+            )
+
+        runner._release_running_agent_state.assert_called_once_with(session_key, run_generation=None)
+
+    @pytest.mark.asyncio
+    async def test_cleanup_releases_session_slot_when_tts_abort_fails(self):
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+        session_key = build_session_key(source)
+        tracking_task = asyncio.create_task(asyncio.sleep(3600))
+        runner._release_running_agent_state = MagicMock()
+
+        class FailingTTS:
+            done = False
+
+            def abort(self, _reason):
+                raise RuntimeError("tts abort failed")
+
+            async def wait_complete(self, timeout):
+                return None
+
+        turn_ctx = SimpleNamespace(
+            stream_consumer_holder=[None], session_key=session_key,
+            run_generation=None, streaming_tts_consumer_holder=[FailingTTS()],
+        )
+
+        await GatewayRunner._run_agent_cleanup_turn_tasks(
+            runner, turn_ctx, progress_task=None, log_task=None,
+            interrupt_monitor=None, _notify_task=None,
+            tracking_task=tracking_task, stream_task=None,
+        )
+
+        runner._release_running_agent_state.assert_called_once_with(session_key, run_generation=None)
+
+    @pytest.mark.asyncio
+    async def test_cleanup_releases_session_slot_before_propagating_cancellation(self):
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+        session_key = build_session_key(source)
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def stream():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        stream_task = asyncio.create_task(stream())
+        runner._release_running_agent_state = MagicMock()
+        parent = asyncio.current_task()
+
+        async def cancel_parent():
+            await started.wait()
+            parent.cancel()
+
+        asyncio.create_task(cancel_parent())
+        tracking_task = asyncio.create_task(asyncio.sleep(3600))
+        turn_ctx = SimpleNamespace(
+            stream_consumer_holder=[object()], session_key=session_key,
+            run_generation=None, streaming_tts_consumer_holder=[None],
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await GatewayRunner._run_agent_cleanup_turn_tasks(
+                runner, turn_ctx, progress_task=None, log_task=None,
+                interrupt_monitor=None, _notify_task=None,
+                tracking_task=tracking_task, stream_task=stream_task,
+            )
+
+        assert cancelled.is_set()
+        runner._release_running_agent_state.assert_called_once_with(session_key, run_generation=None)
 
     @pytest.mark.asyncio
     async def test_steer_mode_transcribes_voice_before_injection(self, monkeypatch):
@@ -517,5 +1198,3 @@ class TestLongRunningNotificationOwnership:
         assert runner._should_emit_long_running_notification(
             "sess", original_agent, executor_task=None
         ) is False
-
-

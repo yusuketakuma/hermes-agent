@@ -144,3 +144,43 @@ class TestPreflightRelayFronted:
             ids = {t["id"] for t in cron_delivery_targets()}
         assert "slack" in ids
         assert "telegram" not in ids
+
+
+class TestDiscordTargetPolicy:
+    def test_cron_refuses_unlisted_discord_channel_before_opening_thread(self, monkeypatch):
+        """Cron's live and standalone lanes share the Discord target floor."""
+        from types import SimpleNamespace
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"discord": {"server_targets": [{"guild_id": "g1", "channel_ids": ["allowed"]}]}},
+        )
+        monkeypatch.setattr(sched_delivery, "_resolve_origin", lambda _job: {})
+        monkeypatch.setattr(sched_delivery, "_target_matches_origin", lambda *args: False)
+        monkeypatch.setattr(sched_delivery, "_target_mirror_eligible", lambda *args, **kwargs: False)
+        monkeypatch.setattr(
+            sched_delivery,
+            "_resolve_target_transport",
+            lambda *args: ((
+                SimpleNamespace(is_relay=False), SimpleNamespace(extra={}), None, {}
+            ), None),
+        )
+        monkeypatch.setattr(
+            sched_delivery,
+            "_open_continuable_cron_thread",
+            lambda *args, **kwargs: pytest.fail("thread creation must not follow a denied target"),
+        )
+
+        errors = []
+        result = sched_delivery._prepare_target_delivery(
+            {"id": "job-1", "origin": {}},
+            {"platform": "discord", "chat_id": "blocked", "thread_id": None},
+            adapters={}, loop=None, config=SimpleNamespace(), notify_delivery=False,
+            mirror_enabled=True, mirror_text="brief", delivery_errors=errors,
+        )
+
+        assert result is None
+        assert errors == [
+            "Refusing to send to Discord target 'blocked': configure an exact "
+            "matching channel_id in discord.server_targets."
+        ]

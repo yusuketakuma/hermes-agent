@@ -34,9 +34,43 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+_BOT_CHAT_DEFAULT_CHANNEL_ID = "1548242914268807228"
+_BOT_CHAT_PROTOCOL_RE = re.compile(
+    r"(?mi)^(?:🧭\s*)?(?:type|種別)=(CHAT|INFO|QUESTION|ANSWER|IDEA|TASK_PROPOSAL|TASK_CREATED|RESULT|BLOCKED)\b"
+)
+
 
 class GatewayInboundMixin:
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
+
+    def _hm_bot_conversation_candidate(self, event: "MessageEvent") -> bool:
+        """Recognize bot-chat traffic even when the lifecycle hook itself is unavailable."""
+        source = getattr(event, "source", None)
+        platform = str(getattr(getattr(source, "platform", None), "value", "")).lower()
+        if platform != "discord" or getattr(source, "is_bot", False) is not True:
+            return False
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if chat_id == _BOT_CHAT_DEFAULT_CHANNEL_ID:
+            return True
+        try:
+            platforms = getattr(getattr(self, "config", None), "platforms", None)
+            discord_config = platforms.get(Platform.DISCORD) if isinstance(platforms, dict) else None
+            extra = getattr(discord_config, "extra", {}) if discord_config else {}
+            bot_chat = extra.get("bot_conversation") if isinstance(extra, dict) else None
+            configured = str(bot_chat.get("channel_id") or "").strip() if isinstance(bot_chat, dict) else ""
+            if configured:
+                return chat_id == configured
+        except Exception:
+            pass
+        if chat_id == _BOT_CHAT_DEFAULT_CHANNEL_ID:
+            return True
+        # A valid bot-chat envelope is the safe fallback when a custom-channel lookup is broken.
+        return bool(_BOT_CHAT_PROTOCOL_RE.search(str(getattr(event, "text", "") or "")))
+
+    @staticmethod
+    def _hm_bot_chat_type(event: "MessageEvent") -> Optional[str]:
+        match = _BOT_CHAT_PROTOCOL_RE.search(str(getattr(event, "text", "") or ""))
+        return match.group(1).upper() if match else None
 
     def _hm_pre_gateway_dispatch_hook(
         self, event: "MessageEvent", source: SessionSource
@@ -46,15 +80,19 @@ class GatewayInboundMixin:
         ``allow``/None → normal dispatch. Runs BEFORE auth so plugins can handle unauthorized senders."""
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-            _hook_results = _invoke_hook(
+            _hook_results = list(_invoke_hook(
                 "pre_gateway_dispatch", event=event, gateway=self,
                 # getattr: bare-runner tests build GatewayRunner via object.__new__ without __init__.
                 session_store=getattr(self, "session_store", None),
-            )
+            ) or [])
         except Exception as _hook_exc:
             logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
+            if self._hm_bot_conversation_candidate(event):
+                logger.warning("Dropping bot-conversation event because mandatory route classification failed")
+                return None
             _hook_results = []
 
+        # A safety skip is terminal even when another plugin returned allow/rewrite first.
         for _result in _hook_results:
             if not isinstance(_result, dict):
                 continue
@@ -66,13 +104,37 @@ class GatewayInboundMixin:
                     source.chat_id or "unknown",
                 )
                 return None
+        for _result in _hook_results:
+            if not isinstance(_result, dict):
+                continue
+            _action = _result.get("action")
             if _action == "rewrite":
                 _new_text = _result.get("text")
                 if isinstance(_new_text, str):
-                    event = dataclasses.replace(event, text=_new_text)
+                    rewritten = dataclasses.replace(event, text=_new_text)
+                    rewritten_type = self._hm_bot_chat_type(rewritten)
+                    if (
+                        _new_text != getattr(event, "text", None)
+                        and (
+                            self._hm_bot_conversation_candidate(event)
+                            or self._hm_bot_conversation_candidate(rewritten)
+                        )
+                    ):
+                        logger.warning(
+                            "Dropping bot-conversation event after non-identity rewrite: %s -> %s",
+                            self._hm_bot_chat_type(event) or "unknown",
+                            rewritten_type or "unknown",
+                        )
+                        return None
+                    event = rewritten
                 break
-            if _action == "allow":
-                break
+        if self._hm_bot_conversation_candidate(event):
+            metadata = getattr(event, "metadata", None)
+            if not isinstance(metadata, dict) or metadata.get("_bot_conversation_route_checked") is not True:
+                logger.warning("Dropping bot-conversation event without a route-classification attestation")
+                return None
+        with suppress(Exception):
+            event._gateway_dispatch_classified = True
         return event
 
     async def _hm_offer_pairing_code(self, source: SessionSource) -> None:
@@ -501,6 +563,19 @@ class GatewayInboundMixin:
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._adapter_for_source(source)
         if adapter:
+            pending_messages = getattr(adapter, "_pending_messages", None)
+            existing = pending_messages.get(_quick_key) if isinstance(pending_messages, dict) else None
+            existing_policy = (
+                (getattr(existing, "metadata", {}) or {}).get("turn_policy")
+                if isinstance(getattr(existing, "metadata", None), dict) else None
+            )
+            incoming_policy = (
+                (getattr(event, "metadata", {}) or {}).get("turn_policy")
+                if isinstance(getattr(event, "metadata", None), dict) else None
+            )
+            if existing is not None and existing_policy != incoming_policy:
+                self._queue_or_replace_pending_event(_quick_key, event)
+                return
             merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
 
     async def _hm_busy_slash_or_photo(
@@ -630,6 +705,13 @@ class GatewayInboundMixin:
                 logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
                 return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
             self._hm_merge_pending_for_source(source, _quick_key, event, merge_text=True)  # picked up after start
+            return None
+        if running_agent is not None and not self._busy_turn_policy_matches(event, running_agent):
+            logger.info(
+                "Queueing priority follow-up for %s because its turn policy differs from the running turn",
+                _quick_key,
+            )
+            self._queue_or_replace_pending_event(_quick_key, event)
             return None
         if self._draining:
             queue_during_drain = self._queue_during_drain_enabled(effective_busy_input_mode)
@@ -1288,18 +1370,22 @@ class GatewayInboundMixin:
         finally:
             # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
             # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.
-            self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
-            # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
-            # recovery pass.
-            await self._clear_durable_active_turn(event)
-            # Release only this turn's generation. Eviction may immediately admit a replacement
-            # through the cold path; an unconditional release here would then clear the replacement
-            # sentinel/agent and lease. Reset/stop release their stale slot before installing a
-            # successor, preserving reset-zombie cleanup without granting gen-N successor authority.
-            self._release_running_agent_state(_quick_key, run_generation=_run_generation)
-            # Turn lease is keyed by (routing key, run generation) so this unwind can only free
-            # the lease its own turn acquired, never a newer turn's.
-            self._release_turn_lease(_quick_key, _run_generation)
+            try:
+                self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
+                # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
+                # recovery pass.
+                await self._clear_durable_active_turn(event)
+            finally:
+                # Release only this turn's generation. Eviction may immediately admit a replacement
+                # through the cold path; an unconditional release here would then clear the replacement
+                # sentinel/agent and lease. Reset/stop release their stale slot before installing a
+                # successor, preserving reset-zombie cleanup without granting gen-N successor authority.
+                try:
+                    self._release_running_agent_state(_quick_key, run_generation=_run_generation)
+                finally:
+                    # Turn lease is keyed by (routing key, run generation) so this unwind can only free
+                    # the lease its own turn acquired, never a newer turn's.
+                    self._release_turn_lease(_quick_key, _run_generation)
 
     def _restore_pending_one_turn_model_override(self, session_key: str, run_generation: int | None = None) -> None:
         """Restore the per-session model override captured by ``/model --once`` or ``/moa``.

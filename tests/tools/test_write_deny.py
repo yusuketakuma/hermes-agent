@@ -87,9 +87,24 @@ class TestWriteAllowed:
         assert _is_write_denied("/tmp/safe_file.txt") is False
 
 
-    def test_hermes_control_files_requested_writable(self):
+    def test_hermes_control_files_follow_write_policy(self):
         from hermes_constants import get_hermes_home
 
         home = get_hermes_home()
-        for name in ["auth.json", "config.yaml", "webhook_subscriptions.json"]:
+        for name in ["auth.json", "webhook_subscriptions.json"]:
             assert _is_write_denied(str(home / name)) is False, f"{name} should be writable"
+        for name in ["config.yaml", "SOUL.md"]:
+            assert _is_write_denied(str(home / name)) is True, f"{name} should be protected"
+
+    def test_profile_control_files_remain_protected_inside_safe_root(self, tmp_path, monkeypatch):
+        root = tmp_path / "hermes"
+        profile_a = root / "profiles" / "alpha"
+        profile_b = root / "profiles" / "beta"
+        profile_a.mkdir(parents=True)
+        profile_b.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(profile_a))
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(root))
+
+        for home in (profile_a, profile_b):
+            assert _is_write_denied(str(home / "config.yaml")) is True
+            assert _is_write_denied(str(home / "SOUL.md")) is True

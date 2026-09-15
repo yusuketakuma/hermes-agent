@@ -101,7 +101,7 @@ def decompose_triage_task(
     """
     from hermes_cli.kanban_db import (
         _canonical_assignee, _link, _append_event, _insert_comment,
-        write_txn, recompute_ready,
+        _json_dict, write_txn, recompute_ready,
     )
 
     if not children:
@@ -115,11 +115,20 @@ def decompose_triage_task(
     now = int(time.time())
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, "
+            "       execution_scope, max_runtime_seconds, max_retries, "
+            "       model_override, provider_override "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if root_row is None or root_row["status"] != "triage":
             return None
+        root_scope = _json_dict(root_row["execution_scope"])
+        if not root_scope:
+            raise ValueError(
+                "execution_scope is required before an agent can decompose a triage task"
+            )
+        if root_assignee and root_assignee not in root_scope.get("allowed_assignees", ()):
+            raise ValueError("root assignee is outside execution_scope.allowed_assignees")
         # Dependency links alone do not imply lineage. The completion event is
         # committed with the graph, and survives re-triage or unlinking.
         if conn.execute(
@@ -174,41 +183,59 @@ def _insert_decomposed_child(
     the dispatcher only ever sees a coherent graph); returns its id.
 
     Workspace: per-child override wins, else inherit the root's kind. Path
-    inherits only when kinds match (a 'dir' child must not point at the
-    root's worktree) and NEVER for worktrees — siblings dispatch concurrently
-    and one shared checkout would put them all on the first sibling's branch
-    with no lock; leaving it unset makes dispatch materialize a fresh
-    ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
+    inherits only for explicit shared ``dir`` workspaces; scratch/worktree
+    siblings get an unset path so dispatch materializes per-child storage
+    rather than letting concurrent workers share a checkout or directory.
     """
     from hermes_cli.kanban_db import (
-        _new_task_id, _canonical_assignee, _append_event,
+        _new_task_id, _canonical_assignee, _append_event, _json_or_null,
+        _prepare_child_scope,
     )
 
     root_ws_kind = root_row["workspace_kind"] or "scratch"
     child_ws_kind = child.get("workspace_kind") or root_ws_kind
     if child.get("workspace_path"):
         child_ws_path = child.get("workspace_path")
-    elif child_ws_kind == "worktree":
+    elif child_ws_kind in {"scratch", "worktree"}:
         child_ws_path = None
     elif child_ws_kind == root_ws_kind:
         child_ws_path = root_row["workspace_path"]
     else:
         child_ws_path = None
+    child_assignee = _canonical_assignee(child.get("assignee"))
+    child_scope, coordination_root_id = _prepare_child_scope(
+        conn, root_id, None,
+        assignee=child_assignee, workspace_kind=child_ws_kind,
+        workspace_path=child_ws_path,
+        max_runtime_seconds=root_row["max_runtime_seconds"],
+        max_retries=root_row["max_retries"],
+        model_override=root_row["model_override"],
+        provider_override=root_row["provider_override"],
+    )
     new_id = _new_task_id()
     body = child.get("body")
     conn.execute(
         "INSERT INTO tasks "
         "(id, title, body, assignee, status, workspace_kind, "
-        " workspace_path, tenant, created_at, created_by) "
-        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+        " workspace_path, tenant, created_at, created_by, max_runtime_seconds, "
+        " max_retries, model_override, provider_override, creator_task_id, "
+        " coordination_root_id, execution_scope) "
+        "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             new_id, child["title"].strip(), body if isinstance(body, str) else None,
-            _canonical_assignee(child.get("assignee")), child_ws_kind, child_ws_path,
-            root_row["tenant"], now, (author or "decomposer"),
+            child_assignee, child_ws_kind, child_ws_path, root_row["tenant"], now,
+            (author or "decomposer"), root_row["max_runtime_seconds"],
+            root_row["max_retries"], root_row["model_override"],
+            root_row["provider_override"], root_id, coordination_root_id,
+            _json_or_null(child_scope),
         ),
     )
     _append_event(
-        conn, new_id, "created", {"by": author or "decomposer", "from_decompose_of": root_id},
+        conn, new_id, "created", {
+            "by": author or "decomposer", "from_decompose_of": root_id,
+            "creator_task_id": root_id, "coordination_root_id": coordination_root_id,
+            "execution_scope": child_scope,
+        },
     )
     inherit_creator_origin(conn, new_id, root_id, created_at=now)
     return new_id

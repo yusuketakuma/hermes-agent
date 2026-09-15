@@ -58,17 +58,27 @@ def relay_env(tmp_path, monkeypatch):
     monkeypatch.setattr(cd, "CHANNEL_ALIASES_PATH", tmp_path / "channel_aliases.json")
     # No gateway-session origins for discord in this temp home.
     monkeypatch.setattr(cd, "_build_from_sessions", lambda _platform: [])
+    # The target-policy floor is independent from relay provenance. Include all
+    # fixture ids here so these tests continue to exercise the relay guard.
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"discord": {"server_targets": [{
+            "guild_id": "g1",
+            "channel_ids": [ATTESTED_CHAT, ARBITRARY_CHAT, HOME_CHAT],
+        }]}},
+    )
     return directory
 
 
-def _send(target: str, sent):
+def _send(target: str, sent, *, internal=False, bot_channel=None):
     """Invoke the real tool, recording any egress it attempts."""
     from types import SimpleNamespace
     from unittest.mock import patch
 
     import asyncio
 
-    discord_cfg = SimpleNamespace(enabled=True, token="t", extra={})
+    extra = {"bot_conversation": {"channel_id": bot_channel}} if bot_channel else {}
+    discord_cfg = SimpleNamespace(enabled=True, token="t", extra=extra)
     config = SimpleNamespace(
         platforms={Platform.DISCORD: discord_cfg},
         get_home_channel=lambda _p: SimpleNamespace(chat_id=HOME_CHAT),
@@ -86,9 +96,10 @@ def _send(target: str, sent):
         "gateway.mirror.mirror_to_session", return_value=False
     ):
         return json.loads(
-            send_message_tool(
-                {"action": "send", "target": target, "message": "hello"}
-            )
+            send_message_tool({
+                "action": "send", "target": target, "message": "hello",
+                **({"internal_bot_conversation": True} if internal else {}),
+            })
         )
 
 
@@ -123,6 +134,28 @@ def test_home_channel_is_attested(relay_env):
 
     assert result["success"] is True
     assert sent == [HOME_CHAT]
+
+
+def test_internal_bot_conversation_is_pinned_to_configured_channel(relay_env):
+    sent: list[str] = []
+    result = _send(
+        f"discord:{ARBITRARY_CHAT}", sent, internal=True, bot_channel=ATTESTED_CHAT,
+    )
+
+    assert result == {
+        "error": "Refusing internal bot conversation: only the configured bot-lounge text channel is allowed."
+    }
+    assert sent == []
+
+
+def test_internal_bot_conversation_allows_only_the_configured_channel(relay_env):
+    sent: list[str] = []
+    result = _send(
+        f"discord:{ATTESTED_CHAT}", sent, internal=True, bot_channel=ATTESTED_CHAT,
+    )
+
+    assert result == {"success": True, "message_id": "m1"}
+    assert sent == [ATTESTED_CHAT]
 
 
 def test_session_origin_chat_is_attested(relay_env, monkeypatch):
@@ -1417,7 +1450,83 @@ def test_tool_guard_forwards_thread_id(monkeypatch):
             None,
         ),
     )
+    monkeypatch.setattr(smt, "_authorize_discord_channel_target", lambda *args: None)
 
     smt._handle_send({"target": "discord:C1:T99", "message": "hi"})
 
     assert seen.get("thread_id") == "T99", "the tool dropped thread_id before the guard"
+
+
+def test_native_discord_send_refuses_channel_outside_target_allowlist(relay_env, monkeypatch):
+    """The native send path must apply the same exact channel floor as REST."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"discord": {"server_targets": [{"guild_id": "g1", "channel_ids": [ATTESTED_CHAT]}]}},
+    )
+    sent: list[str] = []
+    result = _send(f"discord:{ARBITRARY_CHAT}", sent)
+
+    assert result == {
+        "error": (
+            f"Refusing to send to Discord target '{ARBITRARY_CHAT}': configure an exact "
+            "matching channel_id in discord.server_targets."
+        )
+    }
+    assert sent == []
+
+
+def test_native_discord_send_allows_exact_configured_channel(relay_env, monkeypatch):
+    """An explicitly configured channel still reaches the normal relay guard/send path."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"discord": {"server_targets": [{"guild_id": "g1", "channel_ids": [ATTESTED_CHAT]}]}},
+    )
+    sent: list[str] = []
+    result = _send(f"discord:{ATTESTED_CHAT}", sent)
+
+    assert result == {"success": True, "message_id": "m1"}
+    assert sent == [ATTESTED_CHAT]
+
+
+def test_discord_thread_target_is_checked_as_the_actual_destination(monkeypatch):
+    """A permitted parent channel must not authorize an unlisted thread id."""
+    import tools.send_message_tool as smt
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"discord": {"server_targets": [{"guild_id": "g1", "channel_ids": ["parent"]}]}},
+    )
+    denial = smt._authorize_discord_channel_target("parent", "thread")
+
+    assert denial == (
+        "Refusing to send to Discord target 'thread': configure an exact "
+        "matching channel_id in discord.server_targets."
+    )
+
+
+def test_explicitly_allowlisted_normal_thread_remains_available(monkeypatch):
+    import tools.send_message_tool as smt
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"discord": {"server_targets": [{
+            "guild_id": "g1", "channel_ids": ["parent", "thread"],
+        }]}},
+    )
+    assert smt._authorize_discord_channel_target("parent", "thread") is None
+
+
+def test_bot_thread_is_rejected_even_when_parent_is_allowlisted(monkeypatch):
+    import tools.send_message_tool as smt
+
+    denial = smt._authorize_discord_channel_target(
+        "parent", "thread"
+    )
+
+    assert "matching channel_id in discord.server_targets" in denial
+
+    monkeypatch.setattr(
+        "tools.discord_tool._load_allowed_targets_config",
+        lambda: [{"guild_id": "g1", "channel_ids": ["parent"]}],
+    )
+    assert smt._authorize_discord_channel_target("parent", "thread") is not None

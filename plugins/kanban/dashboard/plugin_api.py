@@ -389,6 +389,8 @@ class CreateTaskBody(BaseModel):
     provider_override: Optional[str] = None
     reasoning_effort: Optional[str] = None  # none|minimal|…|ultra; None inherits the profile's level
     project_id: Optional[str] = None  # None inherits the board's scoped project (if any)
+    max_retries: Optional[int] = None
+    execution_scope: Optional[dict[str, Any]] = None
 
 
 @router.post("/tasks")
@@ -604,7 +606,7 @@ def _patch_status(conn, task_id: str, payload: UpdateTaskBody, review_assignee_d
     if s == "archived":
         ok = kanban_db.archive_task(conn, task_id)
     else:
-        with _map_errors(400, _StatusRejected):
+        with _map_errors(400, _StatusRejected, kanban_db.ReviewGateError):
             ok = _apply_status(conn, task_id, s, payload, f"unknown status: {s}")
         if s == "review" and ok and review_assignee_deferred and not payload.assignee:
             ok = kanban_db.assign_task(conn, task_id, None)
@@ -648,7 +650,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         review_assignee_deferred = payload.status == "review" and payload.assignee is not None
         if payload.assignee is not None and not review_assignee_deferred:
             with _map_errors(409, RuntimeError):
-                _require_ok(kanban_db.assign_task(conn, task_id, payload.assignee or None))
+                _require_ok(kanban_db.assign_task(
+                    conn, task_id, payload.assignee or None, allow_scope_rebind=True,
+                ))
         if payload.status is not None:
             _patch_status(conn, task_id, payload, review_assignee_deferred)
         for wanted, apply, _refused in _OVERRIDE_OPS:
@@ -691,7 +695,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
     """Direct status write for drag-drop moves without a structured verb (todo<->ready,
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
     so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
-    terminations: list[tuple[Optional[int], Optional[str]]] = []
+    terminations: list[tuple[str, Optional[int], Optional[str]]] = []
     effective_status = new_status
     with kanban_db.write_txn(conn):
         prev = conn.execute(
@@ -722,7 +726,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             run_id = kanban_db._end_run(
                 conn, task_id, outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)")
-            terminations.append((prev["worker_pid"], prev["claim_lock"]))
+            terminations.append((task_id, prev["worker_pid"], prev["claim_lock"]))
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'status', ?, ?)",
             (task_id, run_id, json.dumps({"status": effective_status, "requested_status": new_status}), int(time.time())))
@@ -730,9 +734,14 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
             # Domain-layer invalidation composes via a savepoint inside our txn and hands
             # back worker terminations to perform post-commit.
             result = kanban_db.invalidate_descendants_for_parent_reopen(conn, task_id, author="dashboard")
-            terminations.extend(result["terminations"])
-    for pid, claim_lock in terminations:
-        kanban_db._terminate_reclaimed_worker(pid, claim_lock)
+            terminations.extend(result.get("termination_records", ()))
+    for terminated_task_id, pid, claim_lock in terminations:
+        termination = kanban_db._terminate_reclaimed_worker(pid, claim_lock)
+        if kanban_db._worker_survived_termination(termination):
+            kanban_db._quarantine_surviving_worker(
+                conn, terminated_task_id, termination,
+                reason="dashboard_status_change_worker_alive",
+            )
     # Re-opening something may have made children stale.
     if effective_status in {"done", "ready", "review"}:
         kanban_db.recompute_ready(conn)
@@ -785,8 +794,16 @@ def _bulk_apply_one(conn, tid: str, payload: BulkTaskBody, board: Optional[str],
             entry.update(ok=False, error=f"transition to {s!r} refused")
     if payload.assignee is not None:
         try:
-            ok = (kanban_db.reassign_task(conn, tid, payload.assignee or None, reclaim_first=True) if payload.reclaim_first
-                  else kanban_db.assign_task(conn, tid, payload.assignee or None))
+            ok = (
+                kanban_db.reassign_task(
+                    conn, tid, payload.assignee or None, reclaim_first=True,
+                    allow_scope_rebind=True,
+                )
+                if payload.reclaim_first
+                else kanban_db.assign_task(
+                    conn, tid, payload.assignee or None, allow_scope_rebind=True,
+                )
+            )
             if not ok:
                 entry.update(ok=False, error="assign refused")
         except RuntimeError as e:
@@ -989,7 +1006,9 @@ def reassign_task_endpoint(task_id: str, payload: ReassignBody, board: Optional[
     (``hermes kanban reassign <task_id> <profile> [--reclaim]``)."""
     with _board_conn(board) as (board, conn):
         ok = kanban_db.reassign_task(
-            conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first), reason=payload.reason)
+            conn, task_id, payload.profile or None, reclaim_first=bool(payload.reclaim_first),
+            reason=payload.reason, allow_scope_rebind=True,
+        )
         if not ok:
             raise _conflict(
                 f"cannot reassign {task_id}: unknown id, or still "

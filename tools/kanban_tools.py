@@ -177,6 +177,34 @@ def _enforce_worker_task_ownership(tid: str) -> None:
             f"to hand off information to other tasks, or kanban_create to spawn follow-up work.")
 
 
+def _enforce_coordination_targets(kb, conn, task_ids: list[str], *, child_id: Optional[str] = None) -> None:
+    """Keep worker-to-worker mutations inside the worker's coordination root."""
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not env_tid:
+        return
+    if not _is_dispatcher_owned_worker():
+        raise _Reject("Kanban mutation refused: this process does not own the dispatcher task")
+    actor = kb.get_task(conn, env_tid)
+    _check(actor is not None, f"worker task {env_tid} is not present on this board")
+    actor_root = actor.coordination_root_id or actor.id
+    targets = []
+    for tid in task_ids:
+        target = kb.get_task(conn, tid)
+        _check(target is not None, f"task {tid} not found")
+        target_root = target.coordination_root_id or target.id
+        _check(
+            target.id == actor.id or target_root == actor_root,
+            f"worker may only mutate its own coordination root; refusing {tid}",
+        )
+        targets.append(target)
+    if child_id is not None:
+        child = next(target for target in targets if target.id == child_id)
+        _check(
+            child.id == actor.id or child.creator_task_id == actor.id,
+            f"worker may only add dependencies to its own task or child task; refusing {child_id}",
+        )
+
+
 def _worker_guard(tool_name: str, args: dict) -> str:
     """Worker mutation preamble, in order: delegate-child rejection, task id
     resolution, task-scope ownership. Returns the task id."""
@@ -309,16 +337,21 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override completion_contract last_failure_error creator_task_id "
+    "coordination_root_id execution_scope".split())
 _TASK_SUMMARY_FIELDS = tuple(
     "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
-    "created_at started_at completed_at current_run_id model_override provider_override".split())
+    "created_at started_at completed_at current_run_id model_override provider_override "
+    "creator_task_id coordination_root_id execution_scope".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
 _ATTACHMENT_FIELDS = tuple(
     "id filename content_type size uploaded_by stored_path created_at".split())
-_CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id")
+_CREATED_FIELDS = (
+    "status", "workspace_kind", "workspace_path", "project_id",
+    "creator_task_id", "coordination_root_id", "execution_scope",
+)
 
 
 def _fields(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
@@ -587,6 +620,12 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"in-flight (no state change). Retry kanban_complete with the same "
                 f"summary/metadata and either drop these ids from created_cards, or pass "
                 f"created_cards=[] to skip the card-claim check entirely.")
+        except kb.ReviewGateError as review_err:
+            return tool_error(
+                f"kanban_complete blocked: {review_err}. Submit the implementation with "
+                "kanban_request_review, then have the configured independent reviewer "
+                "complete it with metadata.review_verdict='pass' and the matching "
+                "review_scope_version.")
         task = kb.get_task(conn, tid)
         _check(ok, (task.last_failure_error if task else None) or
                f"could not complete {tid} (unknown id, stale run, or already terminal)")
@@ -706,6 +745,7 @@ def _handle_comment(args: dict, **kw) -> str:
     # with what reads as a system directive. See #19713.
     author = os.environ.get("HERMES_PROFILE") or "worker"
     with _board(args.get("board")) as (kb, conn):
+        _enforce_coordination_targets(kb, conn, [str(tid)])
         cid = kb.add_comment(conn, tid, author=author, body=str(body))
         return _ok(task_id=tid, comment_id=cid)
 
@@ -832,11 +872,18 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
+    execution_scope = args.get("execution_scope")
+    _check(execution_scope is None or isinstance(execution_scope, dict),
+           "execution_scope must be an object")
     with _board(args.get("board")) as (kb, conn):
         from tools.async_delegation import _current_origin_session_id
         self_tid = (os.environ.get("HERMES_KANBAN_TASK")
                     if _is_dispatcher_owned_worker() else None)
         self_task = kb.get_task(conn, self_tid) if self_tid else None
+        _check(
+            not self_tid or self_task is not None,
+            "worker may not create tasks on a board that does not contain its current task",
+        )
         # The worker/API runtime may be transient; the owning task's origin is durable.
         session_id = (args.get("session_id") or (self_task.session_id if self_task else None)
                       or _current_origin_session_id() or os.environ.get("HERMES_SESSION_ID"))
@@ -852,12 +899,16 @@ def _handle_create(args: dict, **kw) -> str:
             # session's current board.
             board=args.get("board"),
             project_source_task_id=project_source_task_id, triage=triage,
-            creator_task_id=self_tid,
+            # A board-specific connection may not contain the worker's task;
+            # never create a dangling cross-board authority link.
+            creator_task_id=self_tid if self_task is not None else None,
             idempotency_key=args.get("idempotency_key"),
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
+            max_retries=_opt_int(args.get("max_retries")),
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
+            execution_scope=execution_scope,
             initial_status=str(args.get("initial_status") or "running"),
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
@@ -962,6 +1013,9 @@ def _handle_link(args: dict, **kw) -> str:
     child_id = args.get("child_id")
     _check(parent_id and child_id, "both parent_id and child_id are required")
     with _board(args.get("board")) as (kb, conn):
+        _enforce_coordination_targets(
+            kb, conn, [str(parent_id), str(child_id)], child_id=str(child_id),
+        )
         kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
         return _ok(parent_id=parent_id, child_id=child_id)
 

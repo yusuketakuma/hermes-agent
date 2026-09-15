@@ -55,8 +55,9 @@ def _session_with(responses):
     return session_ctx, calls
 
 
-def _pconfig():
-    return SimpleNamespace(token="bot-token", extra={})
+def _pconfig(bot_channel=None):
+    extra = {"bot_conversation": {"channel_id": bot_channel}} if bot_channel else {}
+    return SimpleNamespace(token="bot-token", extra=extra)
 
 
 def _tmpfile(suffix):
@@ -131,3 +132,65 @@ def test_no_caption_non_forum_keeps_separate_text():
         assert calls[1][0].endswith("/messages")
     finally:
         os.unlink(img)
+
+
+def test_internal_bot_conversation_rejects_forum_parent():
+    """Bot Chat must fail closed instead of falling back to a forum thread."""
+    chat_id = "999000333"
+    _remember_channel_is_forum(chat_id, True)
+    res = asyncio.run(
+        _standalone_send(
+            _pconfig(chat_id), chat_id, "<@123> 🧭 HERMES-BOT-CHAT v1",
+            internal_bot_conversation=True,
+        )
+    )
+    assert res == {
+        "error": "Internal bot conversation requires a text channel; forum threads are disabled"
+    }
+
+
+def test_internal_bot_conversation_rejects_media_channel(monkeypatch):
+    chat_id = "999000334"
+    monkeypatch.setattr(
+        "gateway.channel_directory.lookup_channel_type",
+        lambda _platform, _chat_id: "media",
+    )
+    res = asyncio.run(
+        _standalone_send(
+            _pconfig(chat_id), chat_id, "<@123> 🧭 HERMES-BOT-CHAT v1",
+            internal_bot_conversation=True,
+        )
+    )
+    assert res == {
+        "error": "Internal bot conversation requires a configured text channel; forum/media/unknown channels are disabled"
+    }
+
+
+def test_internal_bot_conversation_rejects_thread_target():
+    """A direct bot envelope cannot bypass the REST sender with a thread id."""
+    res = asyncio.run(
+        _standalone_send(
+            _pconfig("999000444"), "999000444", "<@123> 🧭 HERMES-BOT-CHAT v1",
+            thread_id="999000445", internal_bot_conversation=True,
+        )
+    )
+    assert res == {"error": "Internal bot conversation cannot target a Discord thread"}
+
+
+def test_internal_bot_conversation_payload_is_restricted_and_preview_free():
+    chat_id = "999000555"
+    _remember_channel_is_forum(chat_id, False)
+    session_ctx, calls = _session_with([_resp(200, {"id": "m1"})])
+    message = "<@123> 🧭 HERMES-BOT-CHAT v1\ntype=CHAT from=cfo to=cto\ncoordination=topic\nsummary=hello"
+    with patch("aiohttp.ClientSession", return_value=session_ctx):
+        res = asyncio.run(
+            _standalone_send(
+                _pconfig(chat_id), chat_id, message, internal_bot_conversation=True,
+            )
+        )
+    assert res["success"] is True
+    assert calls[0][1] == {
+        "content": message,
+        "allowed_mentions": {"parse": [], "users": ["123"], "roles": [], "replied_user": False},
+        "flags": 4,
+    }

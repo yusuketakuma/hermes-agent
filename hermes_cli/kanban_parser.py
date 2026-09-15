@@ -180,6 +180,9 @@ _SPECS = [
                   f"first failure (no retries), --max-retries 3 allows two retries. Omit to use "
                   f"the dispatcher's kanban.failure_limit config (default "
                   f"{kb.DEFAULT_FAILURE_LIMIT})."),
+        _arg("--execution-scope", metavar="JSON",
+             help="JSON object limiting child assignees, workspaces, model routes, "
+                  "child counts, runtime/retries, and review requirements."),
         _arg("--model", dest="model_override",
              help="Pin the worker to this model (passed as -m <model>) without "
                   "changing the profile's configured model. Combine with --provider "
@@ -213,6 +216,9 @@ _SPECS = [
         _PRIORITY,
         _arg("--created-by", help="Creator/anchor profile"),
         _arg("--idempotency-key", help="Dedup key for the root card"),
+        _arg("--execution-scope", metavar="JSON",
+             help="JSON object limiting swarm assignees, workspaces, model routes, "
+                  "child counts, runtime/retries, and review requirements."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a Kanban Swarm v1 graph (parallel workers → verifier → synthesizer)"),
     _cmd("list", [

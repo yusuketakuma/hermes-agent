@@ -14,7 +14,13 @@ def test_completed_decomposition_survives_retriage(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     with kbc.connect_closing() as conn:
         prerequisite = kb.create_task(conn, title="prerequisite", tenant="business-a")
-        root = kb.create_task(conn, title="root", triage=True, tenant="business-a", parents=[prerequisite])
+        root = kb.create_task(
+            conn, title="root", assignee="default", triage=True, tenant="business-a",
+            parents=[prerequisite], execution_scope={
+                "allowed_assignees": ["default"],
+                "max_children": 1, "max_descendants": 1,
+            },
+        )
         downstream = kb.create_task(conn, title="downstream", parents=[root], tenant="business-a")
         specs = [{"title": "work", "assignee": "default"}]
         first = decompose_triage_task(conn, root, root_assignee="default", children=specs)

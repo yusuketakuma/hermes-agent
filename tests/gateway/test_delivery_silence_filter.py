@@ -15,6 +15,11 @@ from gateway.delivery import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _allow_discord_targets_for_filter_tests(monkeypatch):
+    monkeypatch.setattr("tools.send_message_tool._authorize_discord_channel_target", lambda *_args: None)
+
+
 # --- Truth table -----------------------------------------------------------
 
 POSITIVE_CASES = [
@@ -169,5 +174,4 @@ async def test_non_cron_metadata_still_filters(tmp_path, monkeypatch):
 
 
 # --- Config round-trip ------------------------------------------------------
-
 

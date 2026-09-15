@@ -54,6 +54,19 @@ def _parse_metadata_flag(raw: Optional[str]) -> tuple[Optional[dict], int]:
     return metadata, 0
 
 
+def _parse_execution_scope_flag(raw: Optional[str]) -> tuple[Optional[dict], int]:
+    """Parse ``--execution-scope`` JSON; returns ``(dict|None, rc)``."""
+    if not raw:
+        return None, 0
+    try:
+        scope = json.loads(raw)
+        if not isinstance(scope, dict):
+            raise ValueError("must be a JSON object")
+    except (ValueError, json.JSONDecodeError) as exc:
+        return None, _err(f"kanban: --execution-scope: {exc}", 2)
+    return scope, 0
+
+
 def _run_state_kwargs(args: argparse.Namespace, cmd: str) -> tuple[Optional[dict[str, str]], int]:
     """``--state-type``/``--state-name`` must be given together: ``(kwargs, 0)`` or ``(None, 2)``."""
     st = getattr(args, "state_type", None)
@@ -359,6 +372,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
     if max_retries is not None and max_retries < 1:
         return _err(f"kanban: --max-retries must be >= 1 (got {max_retries}); "
                     "use 1 to trip on the first failure.", 2)
+    execution_scope, rc = _parse_execution_scope_flag(getattr(args, "execution_scope", None))
+    if rc:
+        return rc
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title=args.title, body=args.body, assignee=args.assignee,
@@ -373,6 +389,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             completion_contract=getattr(args, "completion_contract", None),
+            execution_scope=execution_scope,
             initial_status=getattr(args, "initial_status", "running"),
             creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
                              if is_dispatcher_owned_worker_context() else None),
@@ -392,18 +409,26 @@ def _cmd_create(args: argparse.Namespace) -> int:
 
 
 def _cmd_swarm(args: argparse.Namespace) -> int:
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
     try:
         workers = [ks.parse_worker_arg(raw) for raw in (args.worker or [])]
     except ValueError as exc:
         return _err(f"kanban swarm: {exc}", 2)
     if not workers:
         return _err("kanban swarm: at least one --worker is required", 2)
+    execution_scope, rc = _parse_execution_scope_flag(getattr(args, "execution_scope", None))
+    if rc:
+        return rc
     with kbc.connect_closing() as conn:
         created = ks.create_swarm(
             conn, goal=args.goal, workers=workers, verifier_assignee=args.verifier,
             synthesizer_assignee=args.synthesizer, tenant=args.tenant,
             created_by=args.created_by or _profile_author(), priority=args.priority,
             idempotency_key=getattr(args, "idempotency_key", None),
+            execution_scope=execution_scope,
+            creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                             if is_dispatcher_owned_worker_context() else None),
         )
     if getattr(args, "json", False):
         _print_json(created.as_dict())
@@ -572,7 +597,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     with kbc.connect_closing() as conn:
-        ok = kb.assign_task(conn, args.task_id, profile)
+        ok = kb.assign_task(conn, args.task_id, profile, allow_scope_rebind=True)
     return _ok_or_err(ok, f"no such task: {args.task_id}",
                       f"Assigned {args.task_id} to {profile or '(unassigned)'}")
 
@@ -608,7 +633,10 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     reclaim = bool(getattr(args, "reclaim", False))
     with kbc.connect_closing() as conn:
-        ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
+        ok = kb.reassign_task(
+            conn, args.task_id, profile, reclaim_first=reclaim,
+            reason=getattr(args, "reason", None), allow_scope_rebind=True,
+        )
     return _ok_or_err(
         ok,
         f"cannot reassign {args.task_id} (unknown id, or still running — pass --reclaim to release first)",
@@ -880,8 +908,15 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = gate_err
                 return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
-            return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                    expected_run_id=_worker_run_id_for(tid))
+            try:
+                return kb.complete_task(
+                    conn, tid, result=args.result, summary=summary, metadata=metadata,
+                    expected_run_id=_worker_run_id_for(tid))
+            except kb.ReviewGateError as exc:
+                fail_msg[tid] = (
+                    f"cannot complete {tid}: {exc}. Request review first, then have the "
+                    "configured independent reviewer approve it.")
+                return False
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
 

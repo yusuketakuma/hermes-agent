@@ -135,6 +135,17 @@ def _assert_not_delegated_child_mutation() -> None:
         raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
 
 
+def _assert_not_dispatcher_worker_scope_rebind() -> None:
+    """Only an operator context may widen a persisted task scope."""
+    # Keep denying when a worker launches a cron/non-dispatcher child: that
+    # child intentionally drops the identity predicate but still inherits the
+    # task marker.
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        raise PermissionError(
+            "dispatcher workers cannot widen execution_scope; route only to an in-scope assignee"
+        )
+
+
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Best-effort lifecycle hook. Call AFTER the write txn commits (plugins never
     run under the SQLite write lock, always see durable state); failures are
@@ -218,7 +229,7 @@ def notify_task_updated(
 # DispatchResult counters whose non-zero value means the tick did something.
 _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "crashed", "stale",
-    "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
+    "result_unknown", "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable",
 )
@@ -715,6 +726,9 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    creator_task_id: Optional[str] = None
+    coordination_root_id: Optional[str] = None
+    execution_scope: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -732,6 +746,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            execution_scope=_json_or(g("execution_scope")),
         )
 
 
@@ -744,7 +759,8 @@ _TASK_REQUIRED_COLUMNS = (
 _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
-    "current_step_key", "max_retries", "session_id", "completion_contract",
+    "current_step_key", "max_retries", "session_id", "completion_contract", "creator_task_id",
+    "coordination_root_id",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -941,7 +957,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    creator_task_id      TEXT,
+    -- Durable lineage anchor for the bounded agent-to-agent execution scope.
+    coordination_root_id TEXT,
+    -- JSON snapshot of the allowed assignees/workspaces/routes and finite child limits.
+    execution_scope      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -990,7 +1011,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
     ended_at            INTEGER,
     outcome             TEXT,
     -- outcome: completed | blocked | crashed | timed_out | spawn_failed |
-    --          gave_up | reclaimed | (null while still running)
+    --          gave_up | reclaimed | rate_limited | result_unknown |
+    --          (null while still running)
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
@@ -1090,6 +1112,335 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     from hermes_cli.profiles import normalize_profile_name
 
     return normalize_profile_name(assignee)
+
+
+# ``execution_scope`` is deliberately a small, structured snapshot. It is a
+# coordination fence, not a second policy engine: child creation and ordinary
+# assignment may narrow it, while an explicitly named review handoff records
+# its reviewer in the same task snapshot. Legacy rows without a snapshot remain
+# readable but cannot be used as a worker's authority parent.
+_EXECUTION_SCOPE_VERSION = 1
+_SCOPE_LIST_KEYS = {
+    "allowed_assignees", "allowed_workspace_kinds", "allowed_workspace_roots",
+    "allowed_model_routes",
+}
+_SCOPE_SCALAR_KEYS = {
+    "version", "max_children", "max_descendants", "max_runtime_seconds", "max_retries",
+    "review_required", "reviewer",
+}
+
+
+def _scope_nonnegative_int(value: Any, name: str, *, allow_none: bool = True) -> Optional[int]:
+    if value is None and allow_none:
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"execution_scope.{name} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"execution_scope.{name} must be an integer") from None
+    if parsed < 0:
+        raise ValueError(f"execution_scope.{name} must be >= 0")
+    return parsed
+
+
+def _scope_string_list(value: Any, name: str) -> list[str]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"execution_scope.{name} must be a list")
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = str(item).strip()
+        if not text:
+            continue
+        if text not in seen:
+            seen.add(text)
+            result.append(text)
+    return result
+
+
+def _scope_model_routes(value: Any) -> list[dict[str, Optional[str]]]:
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("execution_scope.allowed_model_routes must be a list")
+    routes: list[dict[str, Optional[str]]] = []
+    seen: set[tuple[Optional[str], str]] = set()
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("execution_scope.allowed_model_routes entries must be objects")
+        model = str(item.get("model") or "").strip()
+        provider = str(item.get("provider") or "").strip() or None
+        if not model:
+            raise ValueError("execution_scope.allowed_model_routes requires model")
+        key = (provider, model)
+        if key not in seen:
+            seen.add(key)
+            routes.append({"provider": provider, "model": model})
+    return routes
+
+
+def _normalize_execution_scope(
+    scope: Optional[dict], *, assignee: Optional[str], workspace_kind: str,
+    max_runtime_seconds: Optional[int], max_retries: Optional[int],
+    model_override: Optional[str], provider_override: Optional[str],
+) -> dict:
+    """Validate and normalize a task scope before it is persisted."""
+    if scope is None:
+        raw: dict[str, Any] = {}
+    elif isinstance(scope, dict):
+        raw = dict(scope)
+    else:
+        raise ValueError("execution_scope must be an object")
+    unknown = set(raw) - (_SCOPE_LIST_KEYS | _SCOPE_SCALAR_KEYS)
+    if unknown:
+        raise ValueError(
+            "execution_scope contains unsupported field(s): " + ", ".join(sorted(unknown))
+        )
+
+    version = raw.get("version", _EXECUTION_SCOPE_VERSION)
+    if version != _EXECUTION_SCOPE_VERSION:
+        raise ValueError(f"execution_scope.version must be {_EXECUTION_SCOPE_VERSION}")
+
+    if "allowed_assignees" in raw:
+        assignees = [_canonical_assignee(x) for x in _scope_string_list(raw["allowed_assignees"], "allowed_assignees")]
+        assignees = [x for x in assignees if x]
+    else:
+        assignees = [assignee] if assignee else []
+    if assignee and assignee not in assignees:
+        raise ValueError("execution_scope.allowed_assignees must include the task assignee")
+
+    workspace_kinds = _scope_string_list(
+        raw.get("allowed_workspace_kinds", [workspace_kind]), "allowed_workspace_kinds"
+    )
+    if any(kind not in VALID_WORKSPACE_KINDS for kind in workspace_kinds):
+        raise ValueError(
+            "execution_scope.allowed_workspace_kinds must use "
+            f"{sorted(VALID_WORKSPACE_KINDS)}"
+        )
+    if workspace_kind not in workspace_kinds:
+        raise ValueError("execution_scope.allowed_workspace_kinds must include the task workspace kind")
+
+    roots = None
+    if "allowed_workspace_roots" in raw and raw["allowed_workspace_roots"] is not None:
+        roots = [os.path.realpath(os.path.expanduser(p)) for p in
+                 _scope_string_list(raw["allowed_workspace_roots"], "allowed_workspace_roots")]
+
+    if "allowed_model_routes" in raw:
+        routes = _scope_model_routes(raw["allowed_model_routes"])
+    elif model_override:
+        routes = [{"provider": provider_override, "model": model_override}]
+    else:
+        routes = []
+
+    scope_runtime = _scope_nonnegative_int(
+        raw.get("max_runtime_seconds", max_runtime_seconds), "max_runtime_seconds"
+    )
+    if max_runtime_seconds is not None and (
+        scope_runtime is None or int(max_runtime_seconds) > scope_runtime
+    ):
+        raise ValueError("task max_runtime_seconds exceeds execution_scope.max_runtime_seconds")
+    scope_retries = _scope_nonnegative_int(
+        raw.get("max_retries", max_retries), "max_retries"
+    )
+    if max_retries is not None and (scope_retries is None or int(max_retries) > scope_retries):
+        raise ValueError("task max_retries exceeds execution_scope.max_retries")
+    reviewer = raw.get("reviewer")
+    reviewer = _canonical_assignee(str(reviewer).strip()) if reviewer is not None else None
+    review_required = raw.get("review_required", False)
+    if not isinstance(review_required, bool):
+        raise ValueError("execution_scope.review_required must be boolean")
+    if review_required and not reviewer:
+        raise ValueError("execution_scope.review_required requires execution_scope.reviewer")
+    if reviewer and not review_required:
+        raise ValueError("execution_scope.reviewer requires review_required=true")
+    if reviewer and reviewer not in assignees:
+        raise ValueError("execution_scope.allowed_assignees must include execution_scope.reviewer")
+
+    return {
+        "version": _EXECUTION_SCOPE_VERSION,
+        "allowed_assignees": assignees,
+        "allowed_workspace_kinds": workspace_kinds,
+        "allowed_workspace_roots": roots,
+        "allowed_model_routes": routes,
+        "max_children": _scope_nonnegative_int(raw.get("max_children", 0), "max_children", allow_none=False),
+        "max_descendants": _scope_nonnegative_int(raw.get("max_descendants", 0), "max_descendants", allow_none=False),
+        "max_runtime_seconds": scope_runtime,
+        "max_retries": scope_retries,
+        "review_required": review_required,
+        "reviewer": reviewer,
+    }
+
+
+def _scope_path_allowed(path: Optional[str], roots: Optional[list[str]]) -> bool:
+    if roots is None or path is None:
+        return roots is None
+    resolved = os.path.realpath(os.path.expanduser(path))
+    return any(resolved == root or resolved.startswith(root + os.sep) for root in roots)
+
+
+def _scope_route(provider: Optional[str], model: Optional[str]) -> Optional[tuple[Optional[str], str]]:
+    return (provider, model) if model else None
+
+
+def _bind_scope_assignee(
+    scope: dict, assignee: Optional[str], *, allow_scope_rebind: bool = False,
+) -> tuple[dict, bool, bool]:
+    """Bind an unassigned scope, or explicitly rebind it from an operator context."""
+    if assignee is None:
+        return scope, False, False
+    allowed = scope.get("allowed_assignees")
+    if not isinstance(allowed, list):
+        raise RuntimeError("execution_scope.allowed_assignees is invalid")
+    if allowed:
+        if assignee not in allowed:
+            if not allow_scope_rebind:
+                raise RuntimeError("assignee is outside execution_scope.allowed_assignees")
+            _assert_not_dispatcher_worker_scope_rebind()
+            rebound = dict(scope)
+            rebound["allowed_assignees"] = [*allowed, assignee]
+            return rebound, True, True
+        return scope, False, False
+    bound = dict(scope)
+    bound["allowed_assignees"] = [assignee]
+    return bound, True, False
+
+
+def _scope_is_narrower(parent: dict, child: dict) -> bool:
+    """Return True when every child capability is within its authority parent."""
+    if child.get("version") != parent.get("version"):
+        return False
+    if not set(child.get("allowed_assignees", ())) <= set(parent.get("allowed_assignees", ())):
+        return False
+    if not set(child.get("allowed_workspace_kinds", ())) <= set(parent.get("allowed_workspace_kinds", ())):
+        return False
+    parent_roots, child_roots = parent.get("allowed_workspace_roots"), child.get("allowed_workspace_roots")
+    if parent_roots is not None:
+        if child_roots is None or not all(_scope_path_allowed(root, parent_roots) for root in child_roots):
+            return False
+    parent_routes, child_routes = parent.get("allowed_model_routes", ()), child.get("allowed_model_routes", ())
+    # An empty route list is the normalized "no route restriction" value.
+    # A non-empty parent list therefore requires a non-empty child subset;
+    # letting an empty child list through would turn a pinned parent into an
+    # unrestricted child.
+    parent_route_set = {
+        (route.get("provider"), route.get("model")) for route in parent_routes
+    }
+    child_route_set = {
+        (route.get("provider"), route.get("model")) for route in child_routes
+    }
+    if parent_route_set and (not child_route_set or not child_route_set <= parent_route_set):
+        return False
+    for key in ("max_children", "max_descendants", "max_runtime_seconds", "max_retries"):
+        parent_value, child_value = parent.get(key), child.get(key)
+        if parent_value is not None and (child_value is None or int(child_value) > int(parent_value)):
+            return False
+    if parent.get("review_required") and not child.get("review_required"):
+        return False
+    if parent.get("reviewer") and child.get("reviewer") != parent.get("reviewer"):
+        return False
+    return True
+
+
+def _prepare_child_scope(
+    conn: sqlite3.Connection, creator_task_id: str, requested_scope: Optional[dict], *,
+    assignee: Optional[str], workspace_kind: str, workspace_path: Optional[str],
+    max_runtime_seconds: Optional[int], max_retries: Optional[int],
+    model_override: Optional[str], provider_override: Optional[str],
+    parents: Iterable[str] = (),
+) -> tuple[dict, str]:
+    """Load the authority parent and return ``(scope, root_id)``.
+
+    This runs inside the caller's write transaction so a worker cannot race the
+    child-count check or select a different parent between validation and insert.
+    """
+    parent = conn.execute(
+        "SELECT id, status, coordination_root_id, execution_scope, max_runtime_seconds, "
+        "max_retries, model_override, provider_override FROM tasks WHERE id = ?",
+        (creator_task_id,),
+    ).fetchone()
+    if parent is None:
+        raise ValueError(f"unknown creator task {creator_task_id}")
+    parent_scope = _json_dict(parent["execution_scope"])
+    if not parent_scope:
+        raise ValueError(
+            "execution_scope is required on the authority parent before an agent can create a child"
+        )
+    if parent["status"] not in {"running", "ready", "review", "triage"}:
+        raise ValueError(f"authority parent {creator_task_id} is not active")
+    if max_runtime_seconds is None:
+        max_runtime_seconds = _row_get(parent, "max_runtime_seconds")
+    if max_retries is None:
+        max_retries = _row_get(parent, "max_retries")
+    if model_override is None:
+        model_override = _row_get(parent, "model_override")
+        provider_override = _row_get(parent, "provider_override")
+    requested = dict(requested_scope or {})
+    scope_input = {**parent_scope, **requested}
+    # Explicit child task limits/routes are themselves a narrowing request,
+    # even when the caller omits the verbose scope JSON.
+    if "max_runtime_seconds" not in requested and max_runtime_seconds is not None:
+        parent_runtime = parent_scope.get("max_runtime_seconds")
+        scope_input["max_runtime_seconds"] = (
+            min(int(parent_runtime), int(max_runtime_seconds))
+            if parent_runtime is not None else int(max_runtime_seconds)
+        )
+    if "max_retries" not in requested and max_retries is not None:
+        parent_retries = parent_scope.get("max_retries")
+        scope_input["max_retries"] = (
+            min(int(parent_retries), int(max_retries))
+            if parent_retries is not None else int(max_retries)
+        )
+    if "allowed_model_routes" not in requested and model_override:
+        scope_input["allowed_model_routes"] = [
+            {"provider": provider_override, "model": model_override}
+        ]
+    scope = _normalize_execution_scope(
+        scope_input, assignee=assignee, workspace_kind=workspace_kind,
+        max_runtime_seconds=max_runtime_seconds, max_retries=max_retries,
+        model_override=model_override, provider_override=provider_override,
+    )
+    if not _scope_is_narrower(parent_scope, scope):
+        raise ValueError("child execution_scope must be a narrowing of its authority parent")
+    if assignee not in scope.get("allowed_assignees", ()):
+        raise ValueError("child assignee is outside the authority parent's execution_scope")
+    if workspace_kind not in scope.get("allowed_workspace_kinds", ()):
+        raise ValueError("child workspace kind is outside the authority parent's execution_scope")
+    if workspace_path is not None and not _scope_path_allowed(
+        workspace_path, scope.get("allowed_workspace_roots")
+    ):
+        raise ValueError("child workspace path is outside the authority parent's execution_scope")
+    route = _scope_route(provider_override, model_override)
+    allowed_routes = {
+        (item.get("provider"), item.get("model")) for item in scope.get("allowed_model_routes", ())
+    }
+    if route is not None and route not in allowed_routes:
+        raise ValueError("child model/provider route is outside the authority parent's execution_scope")
+    direct_count = conn.execute(
+        "SELECT COUNT(*) AS n FROM tasks WHERE creator_task_id = ?", (creator_task_id,)
+    ).fetchone()["n"]
+    if int(direct_count) >= int(parent_scope.get("max_children", 0)):
+        raise ValueError("authority parent's execution_scope.max_children has been reached")
+    root_id = parent["coordination_root_id"] or creator_task_id
+    max_descendants = parent_scope.get("max_descendants", 0)
+    if int(max_descendants) <= 0:
+        raise ValueError("authority parent's execution_scope.max_descendants does not allow children")
+    descendant_count = conn.execute(
+        "WITH RECURSIVE descendants(id) AS ("
+        "SELECT id FROM tasks WHERE coordination_root_id = ? AND id != ? "
+        ") SELECT COUNT(*) AS n FROM descendants",
+        (root_id, root_id),
+    ).fetchone()["n"]
+    if int(descendant_count) >= int(max_descendants):
+        raise ValueError("authority root's execution_scope.max_descendants has been reached")
+    for parent_id in parents:
+        parent_row = conn.execute(
+            "SELECT coordination_root_id FROM tasks WHERE id = ?", (parent_id,)
+        ).fetchone()
+        if parent_row is None:
+            raise ValueError(f"unknown parent task {parent_id}")
+        parent_root = parent_row["coordination_root_id"] or parent_id
+        if parent_root != root_id:
+            raise ValueError("child dependencies must stay within the authority coordination root")
+    return scope, root_id
 
 
 def _resolve_project_link(
@@ -1232,6 +1583,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    execution_scope: Optional[dict] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1243,6 +1595,9 @@ def create_task(
     worker model (provider requires model); ``reasoning_effort`` is independent.
     ``creator_task_id``: inherit durable session/subscriptions independently of
     dependency edges; an explicit ``session_id`` still wins.
+    ``execution_scope``: structured authority limits for agent-to-agent child
+    creation. New root tasks get a self-only, no-child default; a worker child
+    must inherit or narrow its authority parent's scope.
     ``project_source_task_id``: cross-profile fallback when ``project_id`` is not
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
@@ -1286,17 +1641,6 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     now = int(time.time())
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
@@ -1313,6 +1657,56 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                # Keep the lookup under BEGIN IMMEDIATE. A preflight SELECT
+                # outside the write transaction permits two identical requests
+                # to both pass the check and insert separate cards.
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id, creator_task_id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        if creator_task_id and row["creator_task_id"] != creator_task_id:
+                            raise ValueError(
+                                "idempotency_key belongs to a different coordination root"
+                            )
+                        return row["id"]
+
+                if creator_task_id:
+                    parent_values = conn.execute(
+                        "SELECT max_runtime_seconds, max_retries, model_override, provider_override "
+                        "FROM tasks WHERE id = ?", (creator_task_id,),
+                    ).fetchone()
+                    if parent_values is None:
+                        raise ValueError(f"unknown creator task {creator_task_id}")
+                    if max_runtime_seconds is None:
+                        max_runtime_seconds = _row_get(parent_values, "max_runtime_seconds")
+                    if max_retries is None:
+                        max_retries = _row_get(parent_values, "max_retries")
+                    if model_override is None:
+                        model_override = _row_get(parent_values, "model_override")
+                        provider_override = _row_get(parent_values, "provider_override")
+                    scope, coordination_root_id = _prepare_child_scope(
+                        conn, creator_task_id, execution_scope, assignee=assignee,
+                        workspace_kind=workspace_kind, workspace_path=workspace_path,
+                        max_runtime_seconds=max_runtime_seconds, max_retries=max_retries,
+                        model_override=model_override, provider_override=provider_override,
+                        parents=parents,
+                    )
+                else:
+                    scope = _normalize_execution_scope(
+                        execution_scope, assignee=assignee, workspace_kind=workspace_kind,
+                        max_runtime_seconds=max_runtime_seconds, max_retries=max_retries,
+                        model_override=model_override, provider_override=provider_override,
+                    )
+                    coordination_root_id = task_id
+                # A scope cap also bounds the task that carries it; otherwise
+                # the cap would protect only descendants and not this worker.
+                if max_runtime_seconds is None:
+                    max_runtime_seconds = scope.get("max_runtime_seconds")
+                if max_retries is None:
+                    max_retries = scope.get("max_retries")
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
@@ -1330,9 +1724,14 @@ def create_task(
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
-                        reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        reasoning_effort, goal_mode, goal_max_turns, session_id,
+                        completion_contract, creator_task_id, coordination_root_id,
+                        execution_scope
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1342,6 +1741,8 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        creator_task_id, coordination_root_id,
+                        json.dumps(scope, ensure_ascii=False, sort_keys=True),
                     ),
                 )
                 for pid in parents:
@@ -1364,6 +1765,8 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "coordination_root_id": coordination_root_id,
+                        "execution_scope": scope,
                     },
                 )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
@@ -1497,12 +1900,17 @@ def list_tasks(
     return [Task.from_row(r) for r in rows]
 
 
-def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) -> bool:
-    """Assign/reassign; raises RuntimeError while the task is running under a claim."""
+def assign_task(
+    conn: sqlite3.Connection, task_id: str, profile: Optional[str], *,
+    allow_scope_rebind: bool = False,
+) -> bool:
+    """Assign/reassign; operator rebinds are explicit and audited."""
     profile = _canonical_assignee(profile)
+    scope_changed = False
+    scope_rebound = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)
+            "SELECT status, claim_lock, assignee, execution_scope FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
         if not row:
             return False
@@ -1511,17 +1919,40 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
                 f"cannot reassign {task_id}: currently running (claimed). "
                 "Wait for completion or reclaim the stale lock first."
             )
+        scope = _json_dict(row["execution_scope"])
+        if row["execution_scope"]:
+            scope, scope_changed, scope_rebound = _bind_scope_assignee(
+                scope, profile, allow_scope_rebind=allow_scope_rebind,
+            )
         if row["assignee"] != profile:
             # The failure streak is per task/profile; a new profile starts fresh.
-            conn.execute(
-                "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?", (profile, task_id),
-            )
+            if scope_changed:
+                conn.execute(
+                    "UPDATE tasks SET assignee = ?, execution_scope = ?, consecutive_failures = 0, "
+                    "last_failure_error = NULL WHERE id = ?",
+                    (profile, json.dumps(scope, ensure_ascii=False, sort_keys=True), task_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
+                    "last_failure_error = NULL WHERE id = ?", (profile, task_id),
+                )
         else:
-            conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
-        _append_event(conn, task_id, "assigned", {"assignee": profile})
+            conn.execute(
+                "UPDATE tasks SET assignee = ?" +
+                (", execution_scope = ?" if scope_changed else "") +
+                " WHERE id = ?",
+                ((profile, json.dumps(scope, ensure_ascii=False, sort_keys=True), task_id)
+                 if scope_changed else (profile, task_id)),
+            )
+        payload = {"assignee": profile}
+        if scope_changed:
+            payload["scope_bound"] = True
+        if scope_rebound:
+            payload["scope_rebound"] = True
+        _append_event(conn, task_id, "assigned", payload)
     # Observer fires AFTER commit so subscribers see durable state.
-    notify_task_updated(conn, task_id, ("assignee",))
+    notify_task_updated(conn, task_id, ("assignee", "execution_scope") if scope_changed else ("assignee",))
     return True
 
 
@@ -1956,10 +2387,11 @@ def _synthesize_ended_run(
 # --- Dependency resolution (todo -> ready) ---
 
 def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
-    """True when the newest ``blocked``/``unblocked`` event is ``blocked`` — an
-    explicit ``kanban_block`` that must wait for an operator. A breaker trip
-    emits ``gave_up`` (not ``blocked``) and so auto-recovers, as does a task
-    with no such event at all (direct DB edit).
+    """True when the newest operator-gated event is still blocking.
+
+    Explicit ``kanban_block`` and ``result_unknown`` both require an operator;
+    ``unblock_task`` emits ``unblocked`` to clear either gate. A breaker trip
+    emits only ``gave_up`` and so keeps the legacy auto-recovery behavior.
 
     See #28712.
     Returns ``False`` when there is no such event at all (e.g. the task was set to ``status='blocked'`` by
@@ -1968,10 +2400,10 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
+        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked', 'result_unknown') "
         "ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return bool(row) and row["kind"] in {"blocked", "result_unknown"}
 
 
 def _latest_event(
@@ -1994,7 +2426,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
         "WHERE task_id = ? AND kind IN ("
         "'blocked', 'block_loop_detected', 'dependency_wait', 'gave_up', "
         "'unblocked', 'changes_requested', 'review_reopened', 'status', 'reclaimed', "
-        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited'"
+        "'stale', 'timed_out', 'crashed', 'spawn_failed', 'rate_limited', 'result_unknown'"
         ") ORDER BY id DESC LIMIT 1", (task_id,),
     ).fetchone()
     payload = _json_dict(_row_get(row, "payload"))
@@ -2418,6 +2850,12 @@ def reclaim_task(
         return False
     prev_lock = row["claim_lock"]
     termination = _terminate_reclaimed_worker(row["worker_pid"], prev_lock, signal_fn=signal_fn)
+    if _worker_survived_termination(termination):
+        _defer_reclaim_for_live_worker(
+            conn, task_id, prev_lock, int(time.time()), termination,
+            reason="manual_reclaim_worker_alive",
+        )
+        return False
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
@@ -2440,7 +2878,7 @@ def reclaim_task(
 
 def reassign_task(
     conn: sqlite3.Connection, task_id: str, profile: Optional[str], *, reclaim_first: bool = False,
-    reason: Optional[str] = None,
+    reason: Optional[str] = None, allow_scope_rebind: bool = False,
 ) -> bool:
     """Reassign (None unassigns); a running task is refused unless
     ``reclaim_first`` releases its claim — the "this profile's model is broken" path."""
@@ -2449,7 +2887,7 @@ def reassign_task(
         reclaim_task(conn, task_id, reason=reason or "reassign")
     # assign_task handles its own txn + the still-running guard.
     try:
-        return assign_task(conn, task_id, profile)
+        return assign_task(conn, task_id, profile, allow_scope_rebind=allow_scope_rebind)
     except RuntimeError:
         # Task is still running and reclaim_first was False; caller
         # needs to decide whether to retry with reclaim.
@@ -2526,6 +2964,72 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class ReviewGateError(ValueError):
+    """Raised when a scoped task is completed without an independent review."""
+
+
+def _review_completion_error(
+    conn: sqlite3.Connection, task_id: str, *, status: Optional[str],
+    metadata: Optional[dict], expected_run_id: Optional[int],
+) -> Optional[str]:
+    """Return a durable review-gate failure, or ``None`` when completion is allowed."""
+    row = conn.execute(
+        "SELECT execution_scope, assignee, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    scope = _json_dict(_row_get(row, "execution_scope"))
+    if not scope.get("review_required"):
+        return None
+    if status not in {"review", "running"}:
+        return "this task requires an independent review before completion"
+    if not isinstance(metadata, dict) or metadata.get("review_verdict") != "pass":
+        return "review_required tasks need metadata.review_verdict='pass'"
+    if metadata.get("review_scope_version") != scope.get("version"):
+        return (
+            "review_required tasks need metadata.review_scope_version matching "
+            f"{scope.get('version')}"
+        )
+    expected_reviewer = _canonical_assignee(scope.get("reviewer"))
+    if expected_run_id is None:
+        if status != "review":
+            return "an active reviewer run must complete this task"
+        requested = _latest_event(conn, task_id, "review_requested")
+        requested_reviewer = _canonical_assignee(
+            _json_dict(_row_get(requested, "payload")).get("reviewer")
+        )
+        receipt_reviewer = _canonical_assignee(
+            metadata.get("reviewer") or metadata.get("reviewed_by")
+        )
+        if not expected_reviewer or requested_reviewer != expected_reviewer:
+            return "review receipt has no configured reviewer provenance"
+        if receipt_reviewer != expected_reviewer:
+            return (
+                "manual review completion needs metadata.reviewer matching "
+                f"{expected_reviewer!r}"
+            )
+        return None
+    current_run_id = _row_get(row, "current_run_id")
+    if current_run_id is None or int(current_run_id) != int(expected_run_id):
+        return "review receipt is not for the current reviewer run"
+    run = conn.execute(
+        "SELECT profile FROM task_runs WHERE id = ? AND task_id = ?",
+        (int(expected_run_id), task_id),
+    ).fetchone()
+    reviewer = _canonical_assignee(_row_get(run, "profile"))
+    if expected_reviewer and reviewer != expected_reviewer:
+        return "the current reviewer is outside execution_scope.reviewer"
+    requested = _latest_event(conn, task_id, "review_requested")
+    implementer = _canonical_assignee(
+        _json_dict(_row_get(requested, "payload")).get("implementer")
+    )
+    if reviewer and implementer and reviewer == implementer:
+        return "the implementer cannot approve its own review"
+    claimed = _latest_event(conn, task_id, "claimed", int(expected_run_id))
+    if _json_dict(_row_get(claimed, "payload")).get("source_status") != "review":
+        return "the current run was not claimed from the review phase"
+    return None
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -2552,6 +3056,20 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
+    # Check before PR acceptance can bind any completion contract. The same
+    # gate is repeated inside the terminal transaction for race safety.
+    review_error = _review_completion_error(
+        conn, task_id, status=_task_status(conn, task_id), metadata=metadata,
+        expected_run_id=expected_run_id,
+    )
+    if review_error:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "completion_rejected",
+                {"reason": review_error, "review_required": True},
+                run_id=_current_run_id(conn, task_id),
+            )
+        raise ReviewGateError(review_error)
     acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
     if acceptance is False:
         return False
@@ -2560,9 +3078,20 @@ def complete_task(
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
             return False
+        prior_status = _task_status(conn, task_id)
+        review_error = _review_completion_error(
+            conn, task_id, status=prior_status, metadata=metadata,
+            expected_run_id=expected_run_id,
+        )
+        if review_error:
+            _append_event(
+                conn, task_id, "completion_rejected",
+                {"reason": review_error, "review_required": True},
+                run_id=_current_run_id(conn, task_id),
+            )
+            raise ReviewGateError(review_error)
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
-        prior_status = _task_status(conn, task_id)
         sql = """
                 UPDATE tasks
                    SET status       = 'done',
@@ -3017,7 +3546,7 @@ def request_review(
         if not _parents_satisfied(conn, task_id):
             return _ret(False, "parent dependencies are not satisfied")
         trow = conn.execute(
-            "SELECT assignee, status, claim_lock, current_run_id "
+            "SELECT assignee, status, claim_lock, current_run_id, execution_scope "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if trow is None:
@@ -3036,6 +3565,14 @@ def request_review(
                 "override) instead of clearing the live run's claim",
             )
         implementer = trow["assignee"]
+        scope = _json_dict(trow["execution_scope"])
+        scoped_reviewer = _canonical_assignee(scope.get("reviewer"))
+        if scope.get("review_required"):
+            if not scoped_reviewer:
+                return _ret(False, "review_required task has no configured reviewer")
+            if reviewer is not None and reviewer != scoped_reviewer:
+                return _ret(False, f"reviewer must be {scoped_reviewer!r} for this task")
+            reviewer = scoped_reviewer
         if reviewer is None:
             reviewer = _prior_reviewer(conn, task_id)
             if reviewer is False:
@@ -3045,10 +3582,34 @@ def request_review(
                     "malformed); pass reviewer= explicitly",
                 )
         reviewer = _canonical_assignee(reviewer)
+        scope_changed = False
+        if scope and reviewer is not None:
+            allowed = scope.get("allowed_assignees")
+            if not isinstance(allowed, list):
+                return _ret(False, "execution_scope.allowed_assignees is invalid")
+            if reviewer not in allowed:
+                if os.environ.get("HERMES_KANBAN_TASK"):
+                    return _ret(
+                        False,
+                        "reviewer is outside execution_scope.allowed_assignees; "
+                        "request an in-scope reviewer or ask an operator to rebind it",
+                    )
+                # An explicit review handoff is an operator/implementer routing
+                # decision; record that reviewer in the snapshot so dispatch
+                # does not silently reject the requested handoff. Child task
+                # creation and ordinary reassignment remain narrowing-only.
+                scope = dict(scope)
+                scope["allowed_assignees"] = [*allowed, reviewer]
+                scope_changed = True
         assignee_sql = ", assignee = ?" if reviewer is not None else ""
+        scope_sql = ", execution_scope = ?" if scope_changed else ""
         run_guard = "" if expected_run_id is None else " AND current_run_id = ?"
+        assignment_values = (
+            *((reviewer,) if reviewer is not None else ()),
+            *((json.dumps(scope, ensure_ascii=False, sort_keys=True),) if scope_changed else ()),
+        )
         params: tuple[Any, ...] = (
-            *(() if reviewer is None else (reviewer,)), task_id,
+            *assignment_values, task_id,
             *(() if expected_run_id is None else (int(expected_run_id),)),
         )
         cur = conn.execute(
@@ -3059,6 +3620,7 @@ def request_review(
                    claim_expires = NULL,
                    worker_pid    = NULL
             """ + assignee_sql + """
+            """ + scope_sql + """
              WHERE id = ?
                AND status IN ('running', 'ready')
             """ + run_guard,
@@ -3080,6 +3642,7 @@ def request_review(
                 "summary": _first_line(summary, 400) or None,
                 "implementer": implementer,
                 "reviewer": reviewer,
+                "scope_bound": True if scope_changed else None,
             },
             run_id=run_id,
         )
@@ -3352,12 +3915,14 @@ def invalidate_descendants_for_parent_reopen(
     action), the opposite of :func:`reopen_review_task`.
 
     Returns ``{"invalidated": [{id, prior_status, new_status, resume_status}],
-    "terminations": [(worker_pid, claim_lock)]}``.
+    "terminations": [(worker_pid, claim_lock)],
+    "termination_records": [(task_id, worker_pid, claim_lock)]}``.
     """
     caller_owns_txn = bool(conn.in_transaction)
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
     terminations: list[tuple[Optional[int], Optional[str]]] = []
+    termination_records: list[tuple[str, Optional[int], Optional[str]]] = []
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
             """
@@ -3386,6 +3951,7 @@ def invalidate_descendants_for_parent_reopen(
             elif previous_status == "running":
                 resume_status = _retry_status_for_run(conn, row["id"], row["current_run_id"])
                 terminations.append((row["worker_pid"], row["claim_lock"]))
+                termination_records.append((row["id"], row["worker_pid"], row["claim_lock"]))
                 run_id = _end_run(
                     conn, row["id"], outcome="reclaimed", status="todo",
                     summary=f"ancestor {task_id} reopened",
@@ -3425,9 +3991,18 @@ def invalidate_descendants_for_parent_reopen(
     if not caller_owns_txn:
         # Standalone: committed above, audit trail durable, safe to kill now.
         # Composed calls leave this to the caller post-commit.
-        for pid, claim_lock in terminations:
-            _terminate_reclaimed_worker(pid, claim_lock)
-    return {"invalidated": invalidated, "terminations": terminations}
+        for descendant_id, pid, claim_lock in termination_records:
+            termination = _terminate_reclaimed_worker(pid, claim_lock)
+            if _worker_survived_termination(termination):
+                _quarantine_surviving_worker(
+                    conn, descendant_id, termination,
+                    reason="ancestor_reopen_worker_alive",
+                )
+    return {
+        "invalidated": invalidated,
+        "terminations": terminations,
+        "termination_records": termination_records,
+    }
 
 
 def specify_triage_task(
@@ -3443,7 +4018,8 @@ def specify_triage_task(
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT title, body, assignee, execution_scope FROM tasks "
+            "WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
@@ -3451,6 +4027,10 @@ def specify_triage_task(
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
+        scope_changed = False
+        scope = _json_dict(existing["execution_scope"])
+        if existing["execution_scope"] and assignee is not None:
+            scope, scope_changed, _scope_rebound = _bind_scope_assignee(scope, assignee)
         if title is not None and title.strip() != (existing["title"] or ""):
             sets.append("title = ?")
             params.append(title.strip())
@@ -3463,6 +4043,10 @@ def specify_triage_task(
             sets.append("assignee = ?")
             params.append(assignee)
             changed_fields.append("assignee")
+        if scope_changed:
+            sets.append("execution_scope = ?")
+            params.append(json.dumps(scope, ensure_ascii=False, sort_keys=True))
+            changed_fields.append("execution_scope")
         params.append(task_id)
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
@@ -4046,6 +4630,7 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _defer_reclaim_for_live_worker,
     _pid_alive,
     _terminate_reclaimed_worker,
+    _quarantine_surviving_worker,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
 )

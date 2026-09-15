@@ -62,7 +62,13 @@ def worker_env(monkeypatch, tmp_path):
     kb.init_db()
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
+        tid = kb.create_task(
+            conn, title="worker-test", assignee="test-worker",
+            execution_scope={
+                "allowed_assignees": ["test-worker", "peer", "qa", "verifier", "reviewer"],
+                "max_children": 50, "max_descendants": 50,
+            },
+        )
         kb.claim_task(conn, tid)
     finally:
         conn.close()
@@ -426,9 +432,8 @@ def test_comment_ignores_caller_supplied_author(worker_env):
     """``args["author"]`` is no longer honored — the author is always
     derived from ``HERMES_PROFILE`` so a worker can't forge a comment
     under an authoritative-looking name like ``hermes-system`` and
-    poison the next worker's prompt context. Cross-task commenting
-    itself remains unrestricted (see #19713); only the author override
-    is removed.
+    poison the next worker's prompt context. The worker may still leave
+    notes for a task in its coordination root.
     """
     from tools import kanban_tools as kt
     out = kt._handle_comment({
@@ -472,7 +477,7 @@ def test_create_happy_path(worker_env):
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
 @pytest.mark.parametrize("target_scoped", [False, True])
 def test_create_explicit_scratch_ignores_ambient_board_project(
-    worker_env, tmp_path, explicit, target_scoped,
+    monkeypatch, worker_env, tmp_path, explicit, target_scoped,
 ):
     """#106342: an explicit scratch / empty project wins over the project the
     session's current board (and, when scoped, the target board itself) carries.
@@ -480,6 +485,10 @@ def test_create_explicit_scratch_ignores_ambient_board_project(
     from hermes_cli import kanban_db as kb
     from hermes_cli import projects_db as pdb
     from tools import kanban_tools as kt
+    # This is a board-routing test, not a worker handoff.  The worker fixture
+    # points at the default board; a target-board create must be orchestrator
+    # context rather than a cross-board child mutation.
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -503,14 +512,28 @@ def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db_connect as kbc
     conn = kbc.connect()
     try:
-        a = kb.create_task(conn, title="A", assignee="x")
-        b = kb.create_task(conn, title="B", assignee="x")
+        b = kb.create_task(conn, title="B", assignee="peer", creator_task_id=worker_env)
     finally:
         conn.close()
     from tools import kanban_tools as kt
-    out = kt._handle_link({"parent_id": a, "child_id": b})
+    out = kt._handle_link({"parent_id": worker_env, "child_id": b})
     d = json.loads(out)
     assert d["ok"] is True
+
+
+def test_worker_rejects_cross_lineage_link(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        other = kb.create_task(conn, title="unrelated", assignee="peer")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_link({"parent_id": worker_env, "child_id": other}))
+    assert out.get("ok") is not True
+    assert "coordination root" in out.get("error", "")
 
 
 def test_unblock_happy_path(monkeypatch, worker_env):
@@ -673,9 +696,8 @@ def test_kanban_guidance_orchestrator_decision_ownership():
 # destructive tools (kanban_complete, kanban_block, kanban_heartbeat,
 # kanban_unblock) must refuse to operate
 # on any OTHER task id, even if the caller supplies an explicit `task_id`
-# argument. Workers legitimately call kanban_show / kanban_list /
-# kanban_comment / kanban_create / kanban_link on other tasks, so those
-# are unrestricted.
+# argument. Workers may use kanban_comment / kanban_link only for the
+# current coordination root; kanban_create is the scoped fan-out path.
 #
 # Orchestrator profiles (no HERMES_KANBAN_TASK in env) are intentionally
 # exempt — their job is routing, and they sometimes close out child
@@ -708,20 +730,13 @@ def test_worker_complete_rejects_foreign_task_id(worker_env):
         conn.close()
 
 
-def test_worker_can_comment_on_foreign_task(worker_env):
-    """Cross-task commenting must remain unrestricted (#19713 policy).
-
-    The author-forgery hardening removed args['author'] but deliberately
-    did NOT add an ownership gate to kanban_comment — comments are the
-    documented handoff channel between tasks. This test pins that policy
-    so a future change accidentally adding ``_enforce_worker_task_ownership``
-    to ``_handle_comment`` would fail CI immediately.
-    """
+def test_worker_can_comment_on_coordination_sibling(worker_env):
+    """Workers may leave handoff notes inside their coordination root."""
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_connect as kbc
     conn = kbc.connect()
     try:
-        other = kb.create_task(conn, title="sibling")
+        other = kb.create_task(conn, title="sibling", assignee="peer", creator_task_id=worker_env)
     finally:
         conn.close()
 
@@ -731,7 +746,7 @@ def test_worker_can_comment_on_foreign_task(worker_env):
         "body": "handoff: see prior findings before starting",
     })
     d = json.loads(out)
-    assert d.get("ok") is True, f"cross-task comment must succeed: {d}"
+    assert d.get("ok") is True, f"coordination comment must succeed: {d}"
 
     # The comment lands on the foreign task, attributed to the worker's
     # HERMES_PROFILE — never to a caller-controlled string.
@@ -743,6 +758,21 @@ def test_worker_can_comment_on_foreign_task(worker_env):
         assert comments[0].body.startswith("handoff:")
     finally:
         conn.close()
+
+
+def test_worker_rejects_cross_lineage_comment(worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
+    try:
+        other = kb.create_task(conn, title="unrelated", assignee="peer")
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = json.loads(kt._handle_comment({"task_id": other, "body": "do not inject"}))
+    assert out.get("ok") is not True
+    assert "coordination root" in out.get("error", "")
 
 
 def test_worker_unblock_rejects_foreign_task_id(worker_env):
@@ -1022,6 +1052,7 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     explicit kanban_notify-subscribe calls per task get that."""
     # worker_env already created <tmp>/.hermes; use a fresh sibling
     # home to avoid mkdir() colliding with the worker's directory.
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     home = tmp_path / "gate-home" / ".hermes"
     home.mkdir(parents=True)
     (home / "config.yaml").write_text(

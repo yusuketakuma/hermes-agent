@@ -972,6 +972,7 @@ def _commit_tool_result(
     blocked: bool,
     effect_disposition,
     observed: bool = False,
+    dispatched: bool = True,
     error_preview: Callable[[Any], Any] = lambda result: result,
     success_log_chars: Optional[int] = None,
     verbose_text: Callable[[Any], Any] = lambda result: result,
@@ -999,6 +1000,14 @@ def _commit_tool_result(
                 agent._record_file_mutation_result(function_name, function_args, function_result, is_error)
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
+            if function_name == "bot_chat" and dispatched:
+                try:
+                    agent._turn_bot_chat_delivery_records.append({
+                        "args": dict(function_args), "result": function_result,
+                        "is_error": bool(is_error),
+                    })
+                except Exception as _delivery_err:
+                    logging.debug("bot-chat delivery verifier record failed: %s", _delivery_err)
         if agent.verbose_logging:
             logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
             _log_result = verbose_text(function_result)
@@ -1083,6 +1092,7 @@ class _ToolOutcome:
     duration: float
     is_error: bool
     blocked: bool
+    dispatched: bool = False
 
 
 def _start_order_gate_timeout(batch_timeout: float | None) -> float:
@@ -1215,7 +1225,7 @@ class _ConcurrentBatch:
             logger.info("tool %s failed (%.2fs): %s", ref.name, duration, result[:200])
         else:
             logger.info("tool %s completed (%.2fs, %d chars)", ref.name, duration, len(result))
-        return _ToolOutcome(ref, result, duration, is_error, blocked)
+        return _ToolOutcome(ref, result, duration, is_error, blocked, dispatched)
 
     def run_worker(self, index: int, start_order: int) -> None:
         """Worker function executed in a thread."""
@@ -1385,6 +1395,7 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
             agent, messages, ref, function_result,
             budget=budget, tool_duration=tool_duration, is_error=is_error, blocked=blocked,
             effect_disposition=effect_disposition, observed=r is not None,
+            dispatched=r.dispatched if r is not None else False,
             error_preview=lambda res: _multimodal_text_summary(res)[:200],
         )
         if committed is None:
@@ -1645,6 +1656,7 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
         agent, messages, ref, function_result,
         budget=budget, tool_duration=tool_duration, is_error=_is_error_result, blocked=managed.blocked,
         effect_disposition="unknown" if _execution_timed_out else None, observed=True,
+        dispatched=managed.dispatched,
         error_preview=lambda res: res[:200] if isinstance(res, str) and not agent.verbose_logging else res,
         success_log_chars=_result_len,
         verbose_text=_multimodal_text_summary,

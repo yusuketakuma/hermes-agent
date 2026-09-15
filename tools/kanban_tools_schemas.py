@@ -114,8 +114,10 @@ KANBAN_COMPLETE_SCHEMA = _schema(
         "metadata": _prop("object", (
                 "Free-form dict of structured facts about this "
                 "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                "\"findings\": [...]}. Surfaced to downstream "
-                "workers alongside ``summary``."
+                "\"findings\": [...]}. For a review-required task, "
+                "the independent reviewer must also set "
+                "review_verdict='pass' and review_scope_version. Surfaced "
+                "to downstream workers alongside ``summary``."
         )),
         "result": _prop("string", (
                 "Short result log line (legacy field, maps to "
@@ -280,8 +282,8 @@ KANBAN_COMMENT_SCHEMA = _schema(
     ),
     {
         "task_id": _prop("string", (
-                "Task id. Required (may be your own task or "
-                "another's — comment threads are per-task)."
+                "Task id. Required. Workers may target their own task or "
+                "another task in the same coordination root."
         )),
         "body": _prop("string", "Markdown-supported comment body."),
     },
@@ -424,6 +426,46 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "dispatcher SIGTERMs the worker and re-queues the "
                 "task with outcome='timed_out'."
         )),
+        "max_retries": _prop("integer", (
+                "Finite consecutive-failure limit for this task. "
+                "Children inherit the authority parent's limit unless "
+                "they explicitly narrow it."
+        )),
+        "execution_scope": {
+            "type": "object",
+            "description": (
+                "Optional authority snapshot for agent-to-agent coordination. "
+                "Agents may only narrow a parent's scope; omitted fields inherit. "
+                "New root tasks default to the assigned profile and no child creation."
+            ),
+            "properties": {
+                "version": {"type": "integer", "enum": [1]},
+                "allowed_assignees": {"type": "array", "items": {"type": "string"}},
+                "allowed_workspace_kinds": {
+                    "type": "array", "items": {"type": "string", "enum": ["scratch", "dir", "worktree"]}
+                },
+                "allowed_workspace_roots": {"type": "array", "items": {"type": "string"}},
+                "allowed_model_routes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "provider": {"type": "string"},
+                            "model": {"type": "string"},
+                        },
+                        "required": ["model"],
+                        "additionalProperties": False,
+                    },
+                },
+                "max_children": {"type": "integer", "minimum": 0},
+                "max_descendants": {"type": "integer", "minimum": 0},
+                "max_runtime_seconds": {"type": "integer", "minimum": 0},
+                "max_retries": {"type": "integer", "minimum": 0},
+                "review_required": {"type": "boolean"},
+                "reviewer": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
         "initial_status": {
             "type": "string",
             "enum": ["running", "blocked"],

@@ -3,7 +3,7 @@
 Deliberately no second scheduler — a small task graph written into the
 existing Kanban kernel:
 
-    planning root (completed immediately)
+    planning root (completed immediately after the graph is built)
         ├─ parallel specialist workers (ready)
         └─ verifier (todo until all workers done)
              └─ synthesizer (todo until verifier done)
@@ -74,7 +74,7 @@ def _activate_root_inline(
     summary: str,
     metadata: dict[str, Any],
 ) -> bool:
-    """Inline blocked→done CAS flip + event insert for the swarm root.
+    """Inline temporary-root→done CAS flip + event insert for the swarm root.
 
     Runs INSIDE create_swarm's write_txn, so it must not call
     ``kb.complete_task`` (own transaction + post-commit side effects that
@@ -90,7 +90,7 @@ def _activate_root_inline(
                claim_expires= NULL,
                worker_pid   = NULL
          WHERE id = ?
-           AND status = 'blocked'
+           AND status = 'ready'
         """,
         (int(time.time()), root_id),
     )
@@ -119,6 +119,8 @@ def create_swarm(
     workspace_path: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
+    creator_task_id: Optional[str] = None,
+    execution_scope: Optional[dict] = None,
 ) -> SwarmCreated:
     """Atomically create a durable, immediately dispatchable Kanban swarm."""
     activation_summary = "Swarm topology planned; root remains the shared blackboard."
@@ -130,9 +132,10 @@ def create_swarm(
             verifier_title=verifier_title, synthesizer_title=synthesizer_title, tenant=tenant,
             created_by=created_by, workspace_kind=workspace_kind, workspace_path=workspace_path,
             priority=priority, idempotency_key=idempotency_key,
+            creator_task_id=creator_task_id, execution_scope=execution_scope,
         )
         root = kb.get_task(conn, created.root_id)
-        if root is not None and root.status == "blocked":
+        if root is not None and root.status == "ready":
             if not _activate_root_inline(
                 conn,
                 created.root_id,
@@ -167,9 +170,10 @@ def _create_swarm_uncommitted(
     verifier_assignee: str, synthesizer_assignee: str, root_title: Optional[str],
     verifier_title: str, synthesizer_title: str, tenant: Optional[str], created_by: str,
     workspace_kind: Optional[str], workspace_path: Optional[str], priority: int, idempotency_key: Optional[str],
+    creator_task_id: Optional[str], execution_scope: Optional[dict],
 ) -> SwarmCreated:
     """Create the swarm graph inside the caller's transaction: planning root
-    (``blocked`` until the caller activates it), parallel workers, a verifier
+    (temporary ``ready`` until the caller activates it), parallel workers, a verifier
     waiting on every worker, and a synthesizer waiting on the verifier."""
     goal = _require_text(goal, "goal")
     verifier_assignee = _require_text(verifier_assignee, "verifier_assignee")
@@ -181,10 +185,36 @@ def _create_swarm_uncommitted(
         _require_text(spec.profile, f"workers[{i}].profile")
         _require_text(spec.title, f"workers[{i}].title")
 
+    # A swarm is a fixed graph, so its default scope is exactly the requested
+    # node set. Further agent fan-out still requires a separate explicit scope.
+    effective_workspace_kind = workspace_kind or "scratch"
+    if workspace_kind is None:
+        try:
+            project_id = (kb._board_meta_for(None).get("project_id") or "").strip() or None
+            if project_id:
+                _, _, _, effective_workspace_kind = kb._resolve_project_link(
+                    conn, project_id, None, "scratch", workspace_path,
+                )
+        except Exception:
+            pass
+    if execution_scope is None:
+        execution_scope = {
+            "allowed_assignees": list(dict.fromkeys([
+                created_by, *(spec.profile for spec in worker_specs),
+                verifier_assignee, synthesizer_assignee,
+            ])),
+            "allowed_workspace_kinds": [effective_workspace_kind],
+            "max_children": len(worker_specs) + 2,
+            "max_descendants": len(worker_specs) + 2,
+        }
+
     common = dict(
         created_by=created_by, tenant=tenant,
         workspace_kind=workspace_kind, workspace_path=workspace_path,
     )
+    child_common = dict(common)
+    if effective_workspace_kind in {"scratch", "worktree"}:
+        child_common["workspace_path"] = None
     root = kb.create_task(
         conn,
         title=root_title or f"Swarm: {goal.splitlines()[0][:80]}",
@@ -194,7 +224,13 @@ def _create_swarm_uncommitted(
         assignee=created_by,
         priority=priority,
         idempotency_key=idempotency_key,
-        initial_status="blocked",
+        # The outer transaction hides this temporary ready state from every
+        # other connection, while allowing the graph builder to use the root
+        # as its authority parent. It is completed before the transaction
+        # commits.
+        initial_status="running",
+        creator_task_id=creator_task_id,
+        execution_scope=execution_scope,
         **common,
     )
 
@@ -219,7 +255,8 @@ def _create_swarm_uncommitted(
             priority=spec.priority or priority,
             skills=spec.skills or None,
             max_runtime_seconds=spec.max_runtime_seconds,
-            **common,
+            creator_task_id=root,
+            **child_common,
         )
         for spec in worker_specs
     ]
@@ -236,7 +273,8 @@ def _create_swarm_uncommitted(
         parents=worker_ids,
         priority=priority,
         skills=["requesting-code-review"],
-        **common,
+        creator_task_id=root,
+        **child_common,
     )
     synthesizer = kb.create_task(
         conn,
@@ -250,7 +288,8 @@ def _create_swarm_uncommitted(
         parents=[verifier],
         priority=priority,
         skills=["humanizer"],
-        **common,
+        creator_task_id=root,
+        **child_common,
     )
 
     created = SwarmCreated(root, worker_ids, verifier, synthesizer)
