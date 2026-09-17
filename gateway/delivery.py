@@ -24,7 +24,8 @@ MAX_PLATFORM_OUTPUT = 4000
 # Matches strings that are *only* a "silence" narration with optional markdown wrappers (*(silent)*,
 # _silent_, 🔇, a bare ".", "…"). Anchored so messages that merely *contain* "silent" never match.
 _SILENCE_NARRATION = re.compile(
-    r'^[\s*_~`]*\(?\s*(silent|silence|no\s+response|no\s+reply)\s*\.?\)?[\s*_~`]*$'
+    r'^[\s*_~`]*[\(（]?\s*(silent|silence|no\s+response|no\s+reply'
+    r'|返信しません|返答しません|応答しません|沈黙)\s*[.。!！]?[\)）]?[\s*_~`]*$'
     r'|^[\s*_~`]*[\U0001F507\.\u2026]+[\s*_~`]*$',
     re.IGNORECASE,
 )

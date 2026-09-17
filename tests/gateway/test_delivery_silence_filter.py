@@ -38,6 +38,11 @@ POSITIVE_CASES = [
     "Silence",
     "no response",
     "No Reply.",
+    "(no response)",
+    "返信しません。",
+    "（返信しません）",
+    "応答しません",
+    "沈黙",
 ]
 
 NEGATIVE_CASES = [

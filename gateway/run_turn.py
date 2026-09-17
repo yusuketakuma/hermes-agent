@@ -1402,6 +1402,22 @@ class GatewayTurnMixin:
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
         _intentional_silence = self._is_intentional_silence(agent_result, response)
+        if not _intentional_silence:
+            # The same hallucinated-silence narration the DeliveryRouter drops pre-send
+            # ("(no response)", 返信しません。, 🔇) reaches this egress door on interactive
+            # turns — in bot-to-bot channels it posts verbatim and mirrors into a loop.
+            try:
+                from gateway.delivery import _is_silence_narration
+
+                if _is_silence_narration(response):
+                    logger.warning(
+                        "Dropping silence-narration final response for session %s: %r",
+                        session_entry.session_id if session_entry else session_key,
+                        response[:40],
+                    )
+                    _intentional_silence = True
+            except Exception:
+                pass
 
         # "(empty)" = the model produced no visible content after exhausting all retries.
         if response == "(empty)" and not _intentional_silence:

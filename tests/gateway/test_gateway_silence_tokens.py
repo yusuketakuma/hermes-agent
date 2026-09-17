@@ -119,6 +119,33 @@ async def test_silence_token_suppresses_delivery_but_preserves_transcript(monkey
 
 
 @pytest.mark.asyncio
+async def test_silence_narration_is_suppressed_on_the_interactive_path(monkeypatch, tmp_path):
+    """Hallucinated silence narration ("(no response)", 返信しません。) is dropped on the
+    interactive egress door too — the same anti-loop contract as the DeliveryRouter filter,
+    so a bot-to-bot channel cannot mirror it back and forth."""
+    for narration in ("(no response)", "返信しません。"):
+        runner = _runner(monkeypatch, tmp_path)
+        runner._run_agent = AsyncMock(return_value={
+            "final_response": narration,
+            "messages": [
+                {"role": "user", "content": "bot ping"},
+                {"role": "assistant", "content": narration},
+            ],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "api_calls": 1,
+            "failed": False,
+        })
+
+        response = await runner._handle_message_with_agent(
+            _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
+        )
+
+        assert response == "", narration
+
+
+@pytest.mark.asyncio
 async def test_empty_success_still_gets_empty_response_warning(monkeypatch, tmp_path):
     runner = _runner(monkeypatch, tmp_path)
     runner._run_agent = AsyncMock(return_value={
