@@ -440,9 +440,15 @@ def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[s
     tools that share one word with it. Empty groups get ``available_sources`` + ``hint`` so
     a lexical miss is not mistaken for a missing capability."""
     config = config or load_config()
-    queries, err = _string_list_arg(args, "queries", dedupe=False, max_items=_MAX_QUERIES_PER_CALL,
+    # Models sometimes use the singular schema-shaped key; accept it without weakening
+    # the requirement for a non-empty search query.
+    queries, err = _string_list_arg({"queries": args.get("queries", args.get("query"))}, "queries",
+                                    dedupe=False, max_items=_MAX_QUERIES_PER_CALL,
                                     retry_hint="Retry with fewer, more targeted queries.")
     if err:
+        if "queries" not in args and "query" not in args:
+            return tool_error('Search needs a query. Call tool_search with '
+                              '{"queries":["send discord message"]}; do not repeat the same invalid call.')
         return err
     raw_limit = args.get("limit")
     limit = (config.search_default_limit if raw_limit is None

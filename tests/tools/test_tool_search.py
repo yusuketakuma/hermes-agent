@@ -345,8 +345,14 @@ class TestAssembly:
 class TestBridgeDispatch:
     def test_tool_search_requires_queries(self):
         from tools.tool_search import dispatch_tool_search
-        result = dispatch_tool_search({}, current_tool_defs=[])
-        assert "error" in json.loads(result)
+        result = json.loads(dispatch_tool_search({}, current_tool_defs=[]))
+        assert "error" in result
+        assert '"queries"' in result["error"]
+
+    def test_tool_search_accepts_singular_query_without_repeating_failure(self):
+        from tools.tool_search import dispatch_tool_search
+        result = json.loads(dispatch_tool_search({"query": "send discord message"}, current_tool_defs=[]))
+        assert result["queries"] == ["send discord message"]
 
     def test_tool_search_rejects_empty_and_overcap_queries(self):
         import tools.tool_search as tool_search
