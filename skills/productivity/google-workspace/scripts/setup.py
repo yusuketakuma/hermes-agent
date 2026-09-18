@@ -55,6 +55,15 @@ SCOPES = [
     "https://www.googleapis.com/auth/documents",
 ]
 
+SERVICE_SCOPES = {
+    "email": SCOPES[:3],
+    "calendar": ["https://www.googleapis.com/auth/calendar.readonly"],
+    "drive": ["https://www.googleapis.com/auth/drive"],
+    "contacts": ["https://www.googleapis.com/auth/contacts.readonly"],
+    "sheets": ["https://www.googleapis.com/auth/spreadsheets"],
+    "docs": ["https://www.googleapis.com/auth/documents"],
+}
+
 # Exact pins: keep in sync with pyproject.toml [project.optional-dependencies].google
 # and tools/lazy_deps.py LAZY_DEPS['skill.google_workspace'].
 # Pinning all protects against version drift and ensures the security floors
@@ -76,6 +85,45 @@ REQUIRED_PACKAGES = [
 REDIRECT_URI = "http://localhost:1"
 
 
+def scopes_for_services(services: str | list[str], *, calendar_write: bool = False) -> list[str]:
+    """Return the least-privileged OAuth scopes for the requested services."""
+
+    if isinstance(services, str):
+        names = [part.strip().lower() for part in services.split(",") if part.strip()]
+    else:
+        names = [str(part).strip().lower() for part in services if str(part).strip()]
+    if not names:
+        raise ValueError("At least one Google service is required")
+    if "all" in names:
+        if len(names) != 1:
+            raise ValueError("all cannot be combined with another service")
+        return list(SCOPES)
+    unknown = sorted(set(names) - set(SERVICE_SCOPES))
+    if unknown:
+        raise ValueError(f"Unknown Google service: {', '.join(unknown)}")
+
+    selected: list[str] = []
+    for name in names:
+        for scope in SERVICE_SCOPES[name]:
+            if scope not in selected:
+                selected.append(scope)
+    if calendar_write and "calendar" in names:
+        readonly = "https://www.googleapis.com/auth/calendar.readonly"
+        write = "https://www.googleapis.com/auth/calendar.events"
+        selected = [write if scope == readonly else scope for scope in selected]
+    return selected
+
+
+def _write_private_text(path: Path, contents: str) -> None:
+    """Write OAuth material with owner-only permissions."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    path.write_text(contents, encoding="utf-8")
+    os.chmod(path, 0o600)
+
+
 def _normalize_authorized_user_payload(payload: dict) -> dict:
     normalized = dict(payload)
     if not normalized.get("type"):
@@ -90,12 +138,24 @@ def _load_token_payload(path: Path = TOKEN_PATH) -> dict:
         return {}
 
 
-def _missing_scopes_from_payload(payload: dict) -> list[str]:
+def _missing_scopes_from_payload(payload: dict, required_scopes: list[str] | None = None) -> list[str]:
     raw = payload.get("scopes") or payload.get("scope")
     if not raw:
         return []
     granted = {s.strip() for s in (raw.split() if isinstance(raw, str) else raw) if s.strip()}
-    return sorted(scope for scope in SCOPES if scope not in granted)
+    required = required_scopes if required_scopes is not None else SCOPES
+    equivalent_scopes = {
+        "https://www.googleapis.com/auth/calendar.readonly": {
+            "https://www.googleapis.com/auth/calendar.readonly",
+            "https://www.googleapis.com/auth/calendar.events",
+            "https://www.googleapis.com/auth/calendar",
+        }
+    }
+    return sorted(
+        scope
+        for scope in required
+        if not (granted & equivalent_scopes.get(scope, {scope}))
+    )
 
 
 def _format_missing_scopes(missing_scopes: list[str]) -> str:
@@ -189,11 +249,11 @@ def _ensure_deps():
         sys.exit(1)
 
 
-def check_auth_live():
+def check_auth_live(required_scopes: list[str] | None = None):
     """Check auth with a real API call to detect disabled_client/account issues."""
     # quiet=True suppresses the "AUTHENTICATED" print from check_auth so the
     # final status line reflects the live-call outcome (OK or FAILED).
-    if not check_auth(quiet=True):
+    if not check_auth(quiet=True, required_scopes=required_scopes):
         return False
     try:
         from googleapiclient.discovery import build
@@ -215,7 +275,7 @@ def check_auth_live():
         return False
 
 
-def check_auth(quiet: bool = False):
+def check_auth(quiet: bool = False, required_scopes: list[str] | None = None):
     """Check if stored credentials are valid. Prints status, exits 0 or 1."""
     if not TOKEN_PATH.exists():
         print(f"NOT_AUTHENTICATED: No token at {TOKEN_PATH}")
@@ -237,7 +297,7 @@ def check_auth(quiet: bool = False):
 
     payload = _load_token_payload(TOKEN_PATH)
     if creds.valid:
-        missing_scopes = _missing_scopes_from_payload(payload)
+        missing_scopes = _missing_scopes_from_payload(payload, required_scopes)
         if missing_scopes:
             print(f"AUTHENTICATED (partial): Token valid but missing {len(missing_scopes)} scopes:")
             for s in missing_scopes:
@@ -249,13 +309,16 @@ def check_auth(quiet: bool = False):
     if creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
-            TOKEN_PATH.write_text(
+            _write_private_text(
+                TOKEN_PATH,
                 json.dumps(
                     _normalize_authorized_user_payload(json.loads(creds.to_json())),
                     indent=2,
-                ), encoding="utf-8"
+                ),
             )
-            missing_scopes = _missing_scopes_from_payload(_load_token_payload(TOKEN_PATH))
+            missing_scopes = _missing_scopes_from_payload(
+                _load_token_payload(TOKEN_PATH), required_scopes
+            )
             if missing_scopes:
                 print(f"AUTHENTICATED (partial): Token refreshed but missing {len(missing_scopes)} scopes:")
                 for s in missing_scopes:
@@ -303,21 +366,23 @@ def store_client_secret(path: str):
         print("Download the correct file from: https://console.cloud.google.com/apis/credentials")
         sys.exit(1)
 
-    CLIENT_SECRET_PATH.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _write_private_text(CLIENT_SECRET_PATH, json.dumps(data, indent=2))
     print(f"OK: Client secret saved to {CLIENT_SECRET_PATH}")
 
 
-def _save_pending_auth(*, state: str, code_verifier: str):
+def _save_pending_auth(*, state: str, code_verifier: str, scopes: list[str]):
     """Persist the OAuth session bits needed for a later token exchange."""
-    PENDING_AUTH_PATH.write_text(
+    _write_private_text(
+        PENDING_AUTH_PATH,
         json.dumps(
             {
                 "state": state,
                 "code_verifier": code_verifier,
                 "redirect_uri": REDIRECT_URI,
+                "scopes": scopes,
             },
             indent=2,
-        ), encoding="utf-8"
+        ),
     )
 
 
@@ -359,7 +424,12 @@ def _extract_code_and_state(code_or_url: str) -> tuple[str, str | None]:
     return params["code"][0], state
 
 
-def get_auth_url():
+def get_auth_url(
+    services: str | list[str] = "all",
+    *,
+    calendar_write: bool = False,
+    output_format: str = "text",
+):
     """Print the OAuth authorization URL. User visits this in a browser."""
     if not CLIENT_SECRET_PATH.exists():
         print("ERROR: No client secret stored. Run --client-secret first.")
@@ -368,9 +438,10 @@ def get_auth_url():
     _ensure_deps()
     from google_auth_oauthlib.flow import Flow
 
+    requested_scopes = scopes_for_services(services, calendar_write=calendar_write)
     flow = Flow.from_client_secrets_file(
         str(CLIENT_SECRET_PATH),
-        scopes=SCOPES,
+        scopes=requested_scopes,
         redirect_uri=REDIRECT_URI,
         autogenerate_code_verifier=True,
     )
@@ -378,12 +449,19 @@ def get_auth_url():
         access_type="offline",
         prompt="consent",
     )
-    _save_pending_auth(state=state, code_verifier=flow.code_verifier)
-    # Print just the URL so the agent can extract it cleanly
-    print(auth_url)
+    _save_pending_auth(
+        state=state,
+        code_verifier=flow.code_verifier,
+        scopes=requested_scopes,
+    )
+    _write_private_text(HERMES_HOME / "google_oauth_last_url.txt", auth_url + "\n")
+    if output_format == "json":
+        print(json.dumps({"auth_url": auth_url}))
+    else:
+        print(auth_url)
 
 
-def exchange_auth_code(code: str):
+def exchange_auth_code(code: str, *, output_format: str = "text"):
     """Exchange the authorization code for a token and save it."""
     if not CLIENT_SECRET_PATH.exists():
         print("ERROR: No client secret stored. Run --client-secret first.")
@@ -400,8 +478,9 @@ def exchange_auth_code(code: str):
     from google_auth_oauthlib.flow import Flow
     from urllib.parse import parse_qs, urlparse
 
+    requested_scopes = list(pending_auth.get("scopes") or SCOPES)
     # Extract granted scopes from the callback URL if the user pasted the full redirect URL.
-    granted_scopes = list(SCOPES)
+    granted_scopes = list(requested_scopes)
     if isinstance(raw_callback, str) and raw_callback.startswith("http"):
         params = parse_qs(urlparse(raw_callback).query)
         scope_val = (params.get("scope") or [""])[0].strip()
@@ -434,19 +513,32 @@ def exchange_auth_code(code: str):
     actually_granted = list(creds.granted_scopes or []) if hasattr(creds, "granted_scopes") and creds.granted_scopes else []
     if actually_granted:
         token_payload["scopes"] = actually_granted
-    elif granted_scopes != SCOPES:
+    elif granted_scopes != requested_scopes:
         # granted_scopes was extracted from the callback URL
         token_payload["scopes"] = granted_scopes
+    else:
+        token_payload["scopes"] = requested_scopes
 
-    missing_scopes = _missing_scopes_from_payload(token_payload)
+    missing_scopes = _missing_scopes_from_payload(token_payload, requested_scopes)
     if missing_scopes:
         print(f"WARNING: Token missing some Google Workspace scopes: {', '.join(missing_scopes)}")
         print("Some services may not be available.")
 
-    TOKEN_PATH.write_text(json.dumps(token_payload, indent=2), encoding="utf-8")
+    _write_private_text(TOKEN_PATH, json.dumps(token_payload, indent=2))
     PENDING_AUTH_PATH.unlink(missing_ok=True)
-    print(f"OK: Authenticated. Token saved to {TOKEN_PATH}")
-    print(f"Profile-scoped token location: {display_hermes_home()}/google_token.json")
+    if output_format == "json":
+        print(
+            json.dumps(
+                {
+                    "status": "authenticated",
+                    "token_path": str(TOKEN_PATH),
+                    "profile": display_hermes_home(),
+                }
+            )
+        )
+    else:
+        print(f"OK: Authenticated. Token saved to {TOKEN_PATH}")
+        print(f"Profile-scoped token location: {display_hermes_home()}/google_token.json")
 
 
 def revoke():
@@ -460,7 +552,7 @@ def revoke():
     from google.auth.transport.requests import Request
 
     try:
-        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), SCOPES)
+        creds = Credentials.from_authorized_user_file(str(TOKEN_PATH))
         if creds.expired and creds.refresh_token:
             creds.refresh(Request())
 
@@ -492,18 +584,44 @@ def main():
     group.add_argument("--auth-code", metavar="CODE", help="Exchange auth code for token")
     group.add_argument("--revoke", action="store_true", help="Revoke and delete stored token")
     group.add_argument("--install-deps", action="store_true", help="Install Python dependencies")
+    parser.add_argument(
+        "--services",
+        default="all",
+        help="Comma-separated Google services (email,calendar,drive,contacts,sheets,docs,all)",
+    )
+    parser.add_argument(
+        "--calendar-write",
+        action="store_true",
+        help="Request calendar.events instead of calendar.readonly",
+    )
+    parser.add_argument("--format", choices=("text", "json"), default="text")
     args = parser.parse_args()
 
     if args.check:
-        sys.exit(0 if check_auth() else 1)
+        try:
+            required_scopes = scopes_for_services(args.services, calendar_write=args.calendar_write)
+        except ValueError as exc:
+            parser.error(str(exc))
+        sys.exit(0 if check_auth(required_scopes=required_scopes) else 1)
     if getattr(args, "check_live", False):
-        sys.exit(0 if check_auth_live() else 1)
+        try:
+            required_scopes = scopes_for_services(args.services, calendar_write=args.calendar_write)
+        except ValueError as exc:
+            parser.error(str(exc))
+        sys.exit(0 if check_auth_live(required_scopes=required_scopes) else 1)
     elif args.client_secret:
         store_client_secret(args.client_secret)
     elif args.auth_url:
-        get_auth_url()
+        try:
+            get_auth_url(
+                args.services,
+                calendar_write=args.calendar_write,
+                output_format=args.format,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
     elif args.auth_code:
-        exchange_auth_code(args.auth_code)
+        exchange_auth_code(args.auth_code, output_format=args.format)
     elif args.revoke:
         revoke()
     elif args.install_deps:

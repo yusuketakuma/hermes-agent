@@ -125,6 +125,11 @@ $GSETUP --auth-url --services calendar,drive,sheets,docs --format json
 $GSETUP --auth-url --services all --format json
 ```
 
+Finance Core schedule billing uses the exact calendar name
+`訪問薬剤管理`. Its synchronization only needs the
+`calendar.readonly` scope. Request `--calendar-write` only when the user has
+explicitly approved creating or modifying Google Calendar events.
+
 This returns JSON with an `auth_url` field and also saves the exact URL to
 `~/.hermes/google_oauth_last_url.txt`.
 

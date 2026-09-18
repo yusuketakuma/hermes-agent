@@ -54,6 +54,13 @@ SCOPES = [
 ]
 
 
+def _write_private_text(path: Path, contents: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    path.write_text(contents, encoding="utf-8")
+    os.chmod(path, 0o600)
+
+
 def _normalize_authorized_user_payload(payload: dict) -> dict:
     normalized = dict(payload)
     if not normalized.get("type"):
@@ -252,11 +259,12 @@ def get_credentials():
     creds = Credentials.from_authorized_user_file(str(TOKEN_PATH), _stored_token_scopes())
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
-        TOKEN_PATH.write_text(
+        _write_private_text(
+            TOKEN_PATH,
             json.dumps(
                 _normalize_authorized_user_payload(json.loads(creds.to_json())),
                 indent=2,
-            ), encoding="utf-8"
+            ),
         )
     if not creds.valid:
         print("Token is invalid. Re-run setup.", file=sys.stderr)

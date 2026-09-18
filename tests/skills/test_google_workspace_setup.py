@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import stat
 from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 
@@ -88,3 +89,25 @@ def test_installer_repairs_stale_transitives(setup_module, monkeypatch):
             "pyasn1==0.6.4",
         ]
     ]
+
+
+def test_calendar_scope_selection_is_least_privilege(setup_module):
+    assert setup_module.scopes_for_services("calendar") == [
+        "https://www.googleapis.com/auth/calendar.readonly"
+    ]
+    assert setup_module.scopes_for_services("calendar", calendar_write=True) == [
+        "https://www.googleapis.com/auth/calendar.events"
+    ]
+    assert setup_module._missing_scopes_from_payload(
+        {"scopes": ["https://www.googleapis.com/auth/calendar.events"]},
+        ["https://www.googleapis.com/auth/calendar.readonly"],
+    ) == []
+
+
+def test_oauth_material_is_written_owner_only(setup_module, tmp_path):
+    target = tmp_path / "oauth" / "token.json"
+
+    setup_module._write_private_text(target, "{}")
+
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert stat.S_IMODE(target.parent.stat().st_mode) == 0o700
