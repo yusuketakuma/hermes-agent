@@ -468,7 +468,8 @@ class TestBusySessionAck:
             source=source, session_key=build_session_key(source), session_id="session-id",
             run_generation=None, _interrupt_depth=0, history=[], context_prompt="",
             _status_thread_metadata=None, event_message_id=None, inbound_message_id=None,
-            turn_policy=None, agent_holder=[MagicMock()], result_holder=[None],
+            turn_policy=None, mute_notification_reply=False,
+            agent_holder=[MagicMock()], result_holder=[None],
             stream_consumer_holder=[None], streaming_tts_consumer_holder=[None],
         )
         turn_runner = SimpleNamespace(run_sync=MagicMock())
@@ -535,7 +536,8 @@ class TestBusySessionAck:
             source=source, session_key=build_session_key(source), session_id="session-id",
             run_generation=None, _interrupt_depth=0, history=[], context_prompt="",
             _status_thread_metadata=None, event_message_id=None, inbound_message_id=None,
-            turn_policy=None, agent_holder=[MagicMock()], result_holder=[None],
+            turn_policy=None, mute_notification_reply=False,
+            agent_holder=[MagicMock()], result_holder=[None],
             stream_consumer_holder=[None], streaming_tts_consumer_holder=[None],
         )
         turn_runner = SimpleNamespace(run_sync=MagicMock())
@@ -610,6 +612,7 @@ class TestBusySessionAck:
             source=source, session_key=session_key, session_id="session-id", run_generation=None,
             _interrupt_depth=0, history=[], context_prompt="", _status_thread_metadata=None,
             event_message_id=None, inbound_message_id=None, turn_policy=None,
+            mute_notification_reply=False,
             agent_holder=[MagicMock()], result_holder=[None], stream_consumer_holder=[consumer],
             streaming_tts_consumer_holder=[None], stream_task_drained=False,
         )

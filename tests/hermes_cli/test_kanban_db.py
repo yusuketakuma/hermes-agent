@@ -455,6 +455,11 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="restart_safe_gateway_child_argv short-circuits to in_process off Linux, so the "
+    "supervised-scope refusal class under test never arises there",
+)
 def test_infrastructure_spawn_refusal_never_charges_the_card(
     kanban_home, monkeypatch, all_assignees_spawnable,
 ):

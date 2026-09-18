@@ -556,10 +556,13 @@ def test_link_running_child_allows_owner_but_rejects_foreign(monkeypatch, worker
     from tools import kanban_tools as kt
 
     with kbc.connect() as conn:
-        own_parent = kb.create_task(conn, title="own review")
+        # The worker-scoped coordination gate only admits targets inside the
+        # worker's own root, so these parents/children are worker-spawned; the
+        # expected_child_run_id check is what must decide each link.
+        own_parent = kb.create_task(conn, title="own review", assignee="peer", creator_task_id=worker_env)
         own_run_id = kb.get_task(conn, worker_env).current_run_id
-        foreign_parent = kb.create_task(conn, title="foreign review")
-        foreign_child = kb.create_task(conn, title="foreign worker")
+        foreign_parent = kb.create_task(conn, title="foreign review", assignee="peer", creator_task_id=worker_env)
+        foreign_child = kb.create_task(conn, title="foreign worker", assignee="peer", creator_task_id=worker_env)
         assert kb.claim_task(conn, foreign_child, claimer="other") is not None
 
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(own_run_id))
