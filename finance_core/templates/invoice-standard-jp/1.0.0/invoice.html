@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  {% set document_type = invoice.get("document_type", "invoice") %}
+  {% set document_label = {"invoice": "請求書", "quote": "見積書", "delivery_note": "納品書", "purchase_order": "発注書", "receipt": "領収書", "correction_invoice": "修正請求書"}.get(document_type, "請求書") %}
+  <title>{{ document_label }} {{ invoice.invoice_number or "DRAFT" }}</title>
+  <style>{{ stylesheet }}</style>
+</head>
+<body>
+  {% if draft %}<div class="draft-watermark">DRAFT</div>{% endif %}
+  <h1 class="document-title">{{ document_label }}</h1>
+  <header class="header">
+    <section class="customer">
+      <strong>{{ customer.billing_name }} {{ customer.honorific }}</strong><br>
+      {% if customer.billing_address %}{{ customer.billing_address }}<br>{% endif %}
+      {% if customer.department %}{{ customer.department }}<br>{% endif %}
+      {% if customer.contact_name %}{{ customer.contact_name }}{% endif %}
+    </section>
+    <section class="issuer">
+      <div class="issuer-name">{{ issuer.legal_name }}</div>
+      {% if issuer.address %}{{ issuer.address }}<br>{% endif %}
+      {% if issuer.qualified_invoice_issuer and issuer.registration_number %}
+        登録番号：{{ issuer.registration_number }}<br>
+      {% endif %}
+      {% if issuer.get("email") %}E-Mail：{{ issuer.get("email") }}<br>{% endif %}
+      {% if issuer.get("phone") %}TEL：{{ issuer.get("phone") }}{% endif %}
+      <div class="invoice-meta">
+        <span>{% if document_type == "invoice" or document_type == "correction_invoice" %}請求{% elif document_type == "quote" %}見積{% elif document_type == "delivery_note" %}納品{% elif document_type == "purchase_order" %}発注{% else %}領収{% endif %}No.</span><strong>{{ invoice.invoice_number or "発行前" }}</strong><br>
+        <span>{% if document_type == "invoice" or document_type == "correction_invoice" %}請求{% elif document_type == "quote" %}見積{% elif document_type == "delivery_note" %}納品{% elif document_type == "purchase_order" %}発注{% else %}領収{% endif %}日</span><strong>{{ invoice.issue_date }}</strong>
+      </div>
+    </section>
+  </header>
+  <div class="period">対象期間：{{ invoice.service_period }}</div>
+  <table>
+    <thead><tr><th>No.</th><th>項目</th><th>数量</th><th>単位</th><th>単価</th><th>金額</th></tr></thead>
+    <tbody>
+    {% for line in invoice.lines %}
+      <tr>
+        <td class="number">{{ loop.index }}</td>
+        <td class="description">{{ line.description }}<div class="subtext">対象：{{ line.service_date_or_period }}　税区分：{% if line.tax_category == "STANDARD_10" %}課税10％{% elif line.tax_category == "REDUCED_8" %}軽減税率8％{% elif line.tax_category == "EXEMPT" %}非課税{% else %}対象外{% endif %}</div></td>
+        <td class="number">{{ line.quantity }}</td>
+        <td>{{ line.unit }}</td>
+        <td class="number">{{ line.unit_price }} {{ invoice.currency }}</td>
+        <td class="number">{{ line.line_subtotal }} {{ invoice.currency }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  <section class="totals">
+    <div><span>小計</span><span>{{ invoice.totals.subtotal }} {{ invoice.currency }}</span></div>
+    {% for tax in invoice.totals.tax_breakdown %}
+      <div><span>{% if tax.tax_category == "EXEMPT" %}非課税{% elif tax.tax_category == "OUT_OF_SCOPE" %}対象外{% else %}消費税（{{ tax.tax_rate }}%）{% endif %}</span><span>{{ tax.tax_amount }} {{ invoice.currency }}</span></div>
+    {% endfor %}
+    <div class="grand-total"><strong>合計</strong><strong>{{ invoice.totals.total }} {{ invoice.currency }}</strong></div>
+    {% if invoice.totals.withholding_tax != "0" %}
+      <div><span>源泉徴収税（{{ invoice.totals.withholding_tax_rate }}%）</span><span>-{{ invoice.totals.withholding_tax }} {{ invoice.currency }}</span></div>
+      <div class="grand-total"><strong>お支払額</strong><strong>{{ invoice.totals.collectible_total }} {{ invoice.currency }}</strong></div>
+    {% endif %}
+    <div class="due-date"><strong>お支払い期限</strong><strong>{{ invoice.due_date }}</strong></div>
+  </section>
+  {% set bank = issuer.bank_account or {} %}
+  {% if bank %}
+  <section class="banking">
+    <p>こちらの銀行口座にお振込をお願い致します。</p>
+    <p class="fee-note">※恐れ入りますが、振込手数料はお客様にてご負担ください。</p>
+    <div class="section-label">お振込先詳細</div>
+    <div class="bank-grid">
+      {% if bank.get("bank_name") %}<span>銀行名</span><span>{{ bank.get("bank_name") }}</span>{% endif %}
+      {% if bank.get("branch_name") %}<span>支店名</span><span>{{ bank.get("branch_name") }}</span>{% endif %}
+      {% if bank.get("account_type") %}<span>口座種別</span><span>{{ bank.get("account_type") }}</span>{% endif %}
+      {% if bank.get("account_number") %}<span>口座番号</span><span>{{ bank.get("account_number") }}</span>{% endif %}
+      {% if bank.get("account_holder") %}<span>口座名義</span><span>{{ bank.get("account_holder") }}</span>{% endif %}
+    </div>
+  </section>
+  {% endif %}
+  <section class="notes"><div class="section-label">備考</div>{{ invoice.notes or "" }}</section>
+</body>
+</html>

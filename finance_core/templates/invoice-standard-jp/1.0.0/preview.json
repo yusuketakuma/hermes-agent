@@ -1,0 +1,26 @@
+{
+  "invoice_number": null,
+  "issue_date": "2026-08-01",
+  "service_period": "2026-08",
+  "due_date": "2026-08-31",
+  "currency": "JPY",
+  "notes": "プレビュー用サンプル。実在の顧客情報を含めない。",
+  "customer": {
+    "billing_name": "サンプル株式会社",
+    "honorific": "御中",
+    "billing_address": "東京都サンプル区"
+  },
+  "issuer": {
+    "legal_name": "発行者サンプル",
+    "qualified_invoice_issuer": true,
+    "registration_number": "T0000000000000",
+    "address": "東京都サンプル市"
+  },
+  "lines": [],
+  "totals": {
+    "subtotal": "0",
+    "tax": "0",
+    "total": "0",
+    "tax_breakdown": []
+  }
+}

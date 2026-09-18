@@ -1,0 +1,43 @@
+@page { size: A4; margin: 12mm 13mm 14mm; }
+* { box-sizing: border-box; }
+body {
+  color: #222;
+  font-family: "Noto Serif JP", "Yu Mincho", "Hiragino Mincho ProN", serif;
+  font-size: 11px;
+  margin: 0;
+}
+.document-title { font-size: 26px; letter-spacing: .45em; margin: 0 0 18px; text-align: center; }
+.header { display: flex; justify-content: space-between; min-height: 155px; }
+.customer { font-size: 13px; line-height: 1.75; max-width: 48%; padding-top: 8px; }
+.customer strong { font-size: 16px; }
+.issuer { font-size: 10px; line-height: 1.65; max-width: 48%; text-align: right; }
+.issuer-name { font-size: 16px; font-weight: 700; margin-bottom: 3px; }
+.invoice-meta { line-height: 1.9; margin-top: 8px; }
+.invoice-meta span { display: inline-block; margin-right: 30px; text-align: left; width: 52px; }
+.period { border-bottom: 1px solid #222; font-size: 11px; margin: 0 0 8px; padding: 4px 6px; text-align: right; }
+table { border-collapse: collapse; margin-top: 8px; table-layout: fixed; width: 100%; }
+th, td { border: 1px solid #222; padding: 5px 6px; text-align: left; vertical-align: middle; }
+th { background: #d9d9d9; font-size: 12px; text-align: center; }
+th:nth-child(1) { width: 6%; }
+th:nth-child(2) { width: 45%; }
+th:nth-child(3) { width: 9%; }
+th:nth-child(4) { width: 10%; }
+th:nth-child(5) { width: 15%; }
+th:nth-child(6) { width: 15%; }
+td { height: 28px; }
+.number { text-align: right; }
+.description { font-size: 11px; }
+.subtext { color: #555; font-size: 8px; margin-top: 2px; }
+.totals { margin: 9px 0 0 auto; width: 48%; }
+.totals div { border-bottom: 1px solid #222; display: flex; justify-content: space-between; padding: 4px 6px; }
+.grand-total { font-size: 14px; }
+.due-date { font-size: 11px; }
+.banking { margin-top: 20px; }
+.banking p { margin: 3px 0; }
+.fee-note { font-size: 9px; }
+.section-label { background: #d9d9d9; border: 1px solid #222; font-weight: 700; margin-top: 8px; padding: 4px 6px; }
+.bank-grid { display: grid; grid-template-columns: 80px 1fr; line-height: 1.6; margin: 4px 0 0 18px; max-width: 55%; }
+.bank-grid span:nth-child(odd) { font-weight: 700; }
+.notes { margin-top: 12px; min-height: 36px; white-space: pre-wrap; }
+.notes .section-label { margin-top: 0; }
+.draft-watermark { color: #b00020; font-size: 64px; font-weight: 800; left: 50%; opacity: .14; position: fixed; top: 45%; transform: translate(-50%, -50%) rotate(-25deg); z-index: -1; }
