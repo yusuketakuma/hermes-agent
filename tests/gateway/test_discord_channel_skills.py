@@ -33,4 +33,22 @@ class TestResolveChannelSkills:
         }
         assert adapter._resolve_channel_skills("999") is None
 
+    def test_accounting_channel_routes_only_to_canonical_finance_skills(self):
+        adapter = _make_adapter()
+        adapter.config.extra = {
+            "channel_skill_bindings": [
+                {
+                    "id": "1537610156563505172",
+                    "skills": [
+                        "skill-fin-discord-finance-workflow",
+                        "skill-fin-invoice-generation",
+                    ],
+                }
+            ]
+        }
+
+        assert adapter._resolve_channel_skills("1537610156563505172") == [
+            "skill-fin-discord-finance-workflow",
+            "skill-fin-invoice-generation",
+        ]
 

@@ -1,0 +1,7 @@
+name: accounting
+version: 0.3.0
+description: >
+  Discord natural-language interface for the independent Finance Core invoice,
+  customer, calendar-billing, payment, revenue, approval, and delivery flows.
+author: Hermes Agent
+kind: standalone
