@@ -146,9 +146,10 @@ async def test_internal_silence_token_suppresses_delivery_but_preserves_transcri
 
 @pytest.mark.asyncio
 async def test_silence_narration_is_suppressed_on_the_interactive_path(monkeypatch, tmp_path):
-    """Hallucinated silence narration ("(no response)", 返信しません。) is dropped on the
-    interactive egress door too — the same anti-loop contract as the DeliveryRouter filter,
-    so a bot-to-bot channel cannot mirror it back and forth."""
+    """Hallucinated silence narration ("(no response)", 返信しません。) never reaches the
+    channel verbatim on the interactive egress door — the anti-loop contract. On a human
+    turn the upstream silence-verdict converts the drop into the visible fallback; on
+    machinery turns it stays fully silent."""
     for narration in ("(no response)", "返信しません。"):
         runner = _runner(monkeypatch, tmp_path)
         runner._run_agent = AsyncMock(return_value={
@@ -168,9 +169,13 @@ async def test_silence_narration_is_suppressed_on_the_interactive_path(monkeypat
             _event(), _source(), "agent:main:telegram:group:-1001:12345", 1
         )
 
-        assert response == "", narration
+        assert narration not in (response or ""), narration
+        # A user-facing turn may not go fully silent — the verdict converts the
+        # narration drop into the visible unexpected-silence reply.
+        assert "silence marker" in response
 
 
+@pytest.mark.asyncio
 async def test_scheduled_heartbeat_silence_suppresses_delivery(monkeypatch, tmp_path):
     """A poller-stamped heartbeat turn may end on a bare marker (#113031); the event stays
     non-internal so authorization and the emergency stop still apply to it."""

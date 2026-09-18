@@ -701,7 +701,7 @@ def test_delivery_only_reasoning_excerpt_does_not_fill_blank_assistant(monkeypat
     )
 
 
-def _finalize(agent, *, exit_reason, final_response, failed=False, api_calls=3):
+def _finalize_with_exit(agent, *, exit_reason, final_response, failed=False, api_calls=3):
     return finalize_turn(
         agent, final_response=final_response, api_call_count=api_calls, interrupted=False, failed=failed,
         messages=[{"role": "user", "content": "q"}, {"role": "assistant", "content": final_response or ""}],
@@ -718,7 +718,7 @@ def test_advisory_exit_reasons_keep_failed_false_but_carry_a_failure_code(monkey
     agent_max = FakeAgent().max_iterations
     for exit_reason, code in (("empty_response_exhausted", "empty_response"),
                               ("local_processing_error(TypeError: x)", "loop_error")):
-        result = _finalize(FakeAgent(), exit_reason=exit_reason, final_response="the model's last thoughts")
+        result = _finalize_with_exit(FakeAgent(), exit_reason=exit_reason, final_response="the model's last thoughts")
         assert result["failed"] is False, exit_reason
         # ``completed`` follows the ordinary rule for a non-failed turn (not forced False here).
         assert result["completed"] == (result["final_response"] is not None and 3 < agent_max), exit_reason
@@ -728,6 +728,6 @@ def test_advisory_exit_reasons_keep_failed_false_but_carry_a_failure_code(monkey
 
 def test_hard_failure_exit_reasons_still_fail_the_turn(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
-    result = _finalize(FakeAgent(), exit_reason="repeated_outer_errors(RuntimeError)", final_response="stopped")
+    result = _finalize_with_exit(FakeAgent(), exit_reason="repeated_outer_errors(RuntimeError)", final_response="stopped")
     assert result["failed"] is True and result["completed"] is False
     assert result["failure_reason"] == "loop_error" and result["error"] == "stopped"

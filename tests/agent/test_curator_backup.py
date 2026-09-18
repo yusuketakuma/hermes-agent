@@ -14,7 +14,7 @@ import pytest
 
 
 @pytest.fixture
-def backup_env(monkeypatch, tmp_path):
+def backup_env(monkeypatch, tmp_path, preserve_module_globals):
     """Isolate HERMES_HOME + reload modules so every test starts clean."""
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -24,8 +24,10 @@ def backup_env(monkeypatch, tmp_path):
 
     # Reload so get_hermes_home picks up the env var fresh.
     import hermes_constants
+    preserve_module_globals(hermes_constants)
     importlib.reload(hermes_constants)
     from agent import curator_backup
+    preserve_module_globals(curator_backup)
     importlib.reload(curator_backup)
     return {"home": home, "skills": home / "skills", "cb": curator_backup}
 
@@ -193,7 +195,7 @@ def test_rollback_rejects_unsafe_tarball(backup_env, monkeypatch):
 # Integration with run_curator_review
 # ---------------------------------------------------------------------------
 
-def test_real_run_takes_pre_snapshot(backup_env, monkeypatch):
+def test_real_run_takes_pre_snapshot(backup_env, monkeypatch, preserve_module_globals):
     """A real (non-dry) curator pass must snapshot the tree before calling
     apply_automatic_transitions. This is the safety net #18373 asked for."""
     cb = backup_env["cb"]
@@ -202,6 +204,7 @@ def test_real_run_takes_pre_snapshot(backup_env, monkeypatch):
 
     # Reload curator module against the freshly-env'd hermes_constants
     from agent import curator
+    preserve_module_globals(curator)
     importlib.reload(curator)
 
     # Stub out LLM review and auto transitions — we only care about the
@@ -245,12 +248,16 @@ def _write_cron_jobs(home: Path, jobs: list) -> Path:
     return path
 
 
-def _reload_cron_jobs(home: Path):
+def _reload_cron_jobs(home: Path, preserve=None):
     """Reload cron.jobs so its module-level HERMES_DIR picks up the tmp HOME."""
     import hermes_constants
+    if preserve:
+        preserve(hermes_constants)
     importlib.reload(hermes_constants)
     if "cron.jobs" in sys.modules:
         import cron.jobs as _cj
+        if preserve:
+            preserve(_cj)
         importlib.reload(_cj)
     else:
         import cron.jobs as _cj  # noqa: F401
@@ -289,7 +296,7 @@ def test_snapshot_cron_jobs_utf8_bom_counted_and_backup_bomless(backup_env):
     assert json.loads(backup_bytes) == json.loads(payload)
 
 
-def test_rollback_restores_cron_skill_links(backup_env):
+def test_rollback_restores_cron_skill_links(backup_env, preserve_module_globals):
     """End-to-end: snapshot with job [alpha,beta], curator-style in-place
     rewrite to [umbrella], then rollback → skills restored to [alpha,beta]."""
     cb = backup_env["cb"]
@@ -298,7 +305,7 @@ def test_rollback_restores_cron_skill_links(backup_env):
     _write_skill(backup_env["skills"], "beta")
     _write_skill(backup_env["skills"], "umbrella")
 
-    cj = _reload_cron_jobs(home)
+    cj = _reload_cron_jobs(home, preserve_module_globals)
     cj.create_job(name="weekly", prompt="p", schedule="every 7d",
                   skills=["alpha", "beta"])
 
@@ -327,7 +334,7 @@ def test_rollback_restores_cron_skill_links(backup_env):
 
 
 
-def test_rollback_leaves_new_jobs_untouched(backup_env):
+def test_rollback_leaves_new_jobs_untouched(backup_env, preserve_module_globals):
     """Jobs created AFTER the snapshot must pass through rollback unchanged."""
     cb = backup_env["cb"]
     home = backup_env["home"]
@@ -337,7 +344,7 @@ def test_rollback_leaves_new_jobs_untouched(backup_env):
     ])
     snap = cb.snapshot_skills(reason="pre-curator-run")
 
-    cj = _reload_cron_jobs(home)
+    cj = _reload_cron_jobs(home, preserve_module_globals)
     jobs = cj.load_jobs()
     jobs.append({"id": "new-after-snapshot", "name": "new",
                  "schedule": "every 15m", "skills": ["brand-new-skill"]})
@@ -356,7 +363,7 @@ def test_rollback_leaves_new_jobs_untouched(backup_env):
 
 
 
-def test_restore_cron_skill_links_standalone(backup_env):
+def test_restore_cron_skill_links_standalone(backup_env, preserve_module_globals):
     """Unit-level test on _restore_cron_skill_links without the full rollback.
     Verifies the report structure carefully."""
     cb = backup_env["cb"]
@@ -377,7 +384,7 @@ def test_restore_cron_skill_links_standalone(backup_env):
         {"id": "job-2", "name": "two", "skill": "legacy-single", "schedule": "every 1h"},
         {"id": "job-new", "name": "new", "skills": ["x"], "schedule": "every 1h"},
     ])
-    _reload_cron_jobs(home)
+    _reload_cron_jobs(home, preserve_module_globals)
 
     report = cb._restore_cron_skill_links(backups_dir)
     assert report["attempted"] is True

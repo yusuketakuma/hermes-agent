@@ -213,6 +213,9 @@ def _install_fake_openwakeword(monkeypatch):
     monkeypatch.setitem(sys.modules, "openwakeword", oww)
     monkeypatch.setitem(sys.modules, "openwakeword.model", model_mod)
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
+    # The download-vs-model-path contract under test is framework-agnostic;
+    # pin onnx so a real macOS ARM64 host doesn't demand the tflite runtime.
+    monkeypatch.setattr(ww, "resolve_inference_framework", lambda cfg: "onnx")
     return calls
 
 

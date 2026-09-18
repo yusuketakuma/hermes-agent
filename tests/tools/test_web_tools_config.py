@@ -402,9 +402,15 @@ class TestParallelClientConfig:
         fake_parallel.Parallel = Parallel
         fake_parallel.AsyncParallel = AsyncParallel
         sys.modules["parallel"] = fake_parallel
+        # The fake `parallel` module stands in for the SDK — skip the lazy
+        # install gate (disabled under managed-scope test homes).
+        self._lazy_ensure_patch = patch(
+            "plugins.web._common.lazy_ensure", lambda *a, **k: None)
+        self._lazy_ensure_patch.start()
 
     def teardown_method(self):
         import tools.web_tools
+        self._lazy_ensure_patch.stop()
         tools.web_tools._parallel_client = None
         os.environ.pop("PARALLEL_API_KEY", None)
         sys.modules.pop("parallel", None)

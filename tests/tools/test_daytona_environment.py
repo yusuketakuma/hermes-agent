@@ -43,6 +43,11 @@ def _patch_daytona_imports(monkeypatch):
     daytona_mod.SandboxState = _SandboxState
 
     monkeypatch.setitem(__import__("sys").modules, "daytona", daytona_mod)
+    # The SDK stub above must also bypass the lazy-install gate: managed
+    # runtimes set security.allow_lazy_installs=false, so a real ensure()
+    # would refuse even though the module is already importable here.
+    monkeypatch.setattr(
+        "tools.environments.daytona.ensure_lazy_dep", lambda *a, **k: None)
     return daytona_mod
 
 

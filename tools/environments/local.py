@@ -763,7 +763,10 @@ def _kill_process_group_posix(proc) -> None:
             _wait_for_group_exit(proc, pgid, 2.0)
             with contextlib.suppress(subprocess.TimeoutExpired, OSError):
                 proc.wait(timeout=0.2)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
+        # PermissionError: macOS killpg returns EPERM for a zombie process
+        # group (rg exited between poll() and killpg) — already dead, so
+        # nothing to signal; same as the group being gone entirely.
         pass
     _sweep_escaped_descendants(descendants, pgid)
 

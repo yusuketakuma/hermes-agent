@@ -600,7 +600,7 @@ def _last_turn_reasoning(messages) -> Optional[Any]:
     return None
 
 
-def _apply_output_transform(agent, final_response, logger, *, platform) -> Tuple[Any, bool, Optional[Any]]:
+def _apply_output_transform(agent, final_response, logger, *, platform, turn_id) -> Tuple[Any, bool, Optional[Any]]:
     """Apply the first ``transform_llm_output`` result before evidence gates and persistence."""
     transformed, pre_transform = False, None
     # First hook to return a string wins; None/empty leaves the text unchanged.
@@ -644,7 +644,7 @@ def _apply_output_hooks(
 ) -> Tuple[Any, bool, Optional[Any]]:
     """Compatibility wrapper for callers that invoke both output hooks directly."""
     final_response, transformed, pre_transform = _apply_output_transform(
-        agent, final_response, logger, platform=platform,
+        agent, final_response, logger, platform=platform, turn_id=turn_id,
     )
     before_gate = final_response
     final_response, gate_changed = _apply_bot_chat_delivery_gate(agent, final_response, logger)
@@ -716,7 +716,7 @@ def finalize_turn(
         )
     if final_response and not interrupted:
         final_response, _response_transformed, _pre_transform_response = _apply_output_transform(
-            agent, final_response, logger, platform=_platform,
+            agent, final_response, logger, platform=_platform, turn_id=turn_id,
         )
     if final_response:
         _before_gate = final_response

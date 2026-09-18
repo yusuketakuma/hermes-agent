@@ -21,7 +21,7 @@ import pytest
 
 
 @pytest.fixture
-def curator_env(tmp_path, monkeypatch):
+def curator_env(tmp_path, monkeypatch, preserve_module_globals):
     home = tmp_path / ".hermes"
     home.mkdir()
     (home / "skills").mkdir()
@@ -31,8 +31,10 @@ def curator_env(tmp_path, monkeypatch):
 
     import importlib
     import hermes_constants
+    preserve_module_globals(hermes_constants)
     importlib.reload(hermes_constants)
     from agent import curator
+    preserve_module_globals(curator)
     importlib.reload(curator)
     yield curator
 

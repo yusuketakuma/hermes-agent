@@ -2,7 +2,17 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from cli import HermesCLI
+
+
+@pytest.fixture(autouse=True)
+def _local_clipboard_env(monkeypatch):
+    """/copy prefers OSC 52 inside remote shells; pin the local path so
+    ``write_clipboard_text`` (pbcopy & friends) is what the test observes."""
+    for var in ("SSH_CONNECTION", "SSH_TTY", "SSH_CLIENT"):
+        monkeypatch.delenv(var, raising=False)
 
 
 def _make_cli() -> HermesCLI:

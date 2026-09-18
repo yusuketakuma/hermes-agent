@@ -154,7 +154,7 @@ def test_fal_text_only_routes_to_text_endpoint(matrix_env, family_id):
         {"prompt": "a dog running"},
     )
 
-    assert result["success"] is True, f"{family_id}: {result.get('error')}"
+    assert result["success"] is True, f"{family_id}: {result}"
     assert result["modality"] == "text"
     assert result["provider"] == "fal"
 
@@ -187,7 +187,7 @@ def test_fal_image_to_video_routes_to_image_endpoint(matrix_env, family_id):
     )
 
     meta = FAL_FAMILIES[family_id]
-    assert result["success"] is True, f"{family_id}: {result.get('error')}"
+    assert result["success"] is True, f"{family_id}: {result}"
     assert result["modality"] == "image"
     assert len(fal_calls) == 1
     assert fal_calls[0]["endpoint"] == meta["image_endpoint"]
@@ -214,7 +214,7 @@ def test_xai_text_only_via_tool_surface(matrix_env):
         {"video_gen": {"provider": "xai"}},
         {"prompt": "a dog running"},
     )
-    assert result["success"] is True
+    assert result["success"] is True, result
     assert result["modality"] == "text"
     assert result["provider"] == "xai"
 
@@ -246,7 +246,7 @@ def test_tool_model_arg_overrides_config(matrix_env):
         {"prompt": "a dog", "model": "veo3.1"},
     )
 
-    assert result["success"] is True
+    assert result["success"] is True, result
     assert result["model"] == "veo3.1"
     # Outbound endpoint reflects the override, not config
     assert fal_calls[0]["endpoint"] == "fal-ai/veo3.1"
@@ -266,7 +266,7 @@ def test_tool_model_arg_with_image_url_routes_to_override_image_endpoint(matrix_
         },
     )
 
-    assert result["success"] is True
+    assert result["success"] is True, result
     assert result["model"] == "kling-v3-4k"
     assert fal_calls[0]["endpoint"] == "fal-ai/kling-video/v3/4k/image-to-video"
     # Kling 4K uses start_image_url

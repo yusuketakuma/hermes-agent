@@ -4,6 +4,7 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
@@ -49,6 +50,9 @@ def test_real_binaries_execute_leading_dash_program_payload(
     """A PATH marker proves these binaries do not reparse '-program' as an option."""
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
+    if tool == "man" and args[0].startswith("--") and sys.platform != "linux":
+        # BSD man has no GNU-style long options; only -P exists there.
+        pytest.skip("BSD man does not accept --pager")
 
     marker = tmp_path / "executed"
     payload = tmp_path / "-payload-marker"
@@ -58,7 +62,10 @@ def test_real_binaries_execute_leading_dash_program_payload(
     input_file.write_text("needle\n")
     resolved_args = [arg.format(input=str(input_file)) for arg in args]
     input_text = (
-        "\n".join(str(number) for number in range(10_000, 0, -1)) + "\n"
+        # 500 lines still overflows sort --buffer-size=1K (forces a temp
+        # file → compress-program exec) without making BSD sort spawn the
+        # payload thousands of times (which timed the test out on macOS).
+        "\n".join(str(number) for number in range(500, 0, -1)) + "\n"
         if stdin == "{bulk}"
         else stdin
     )
@@ -70,7 +77,11 @@ def test_real_binaries_execute_leading_dash_program_payload(
     }
     argv = [tool, *resolved_args]
     if needs_tty:
-        argv = ["script", "-qec", shlex.join(argv), "/dev/null"]
+        if sys.platform == "darwin":
+            # BSD script takes the command positionally: script -q file cmd...
+            argv = ["script", "-q", "/dev/null", *argv]
+        else:
+            argv = ["script", "-qec", shlex.join(argv), "/dev/null"]
 
     subprocess.run(argv, input=input_text, text=True, capture_output=True, env=env, timeout=20)
 

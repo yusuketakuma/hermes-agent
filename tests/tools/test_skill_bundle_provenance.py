@@ -344,6 +344,7 @@ def test_real_temp_repo_and_home_install_e2e(served_repo, monkeypatch, tmp_path)
     do_install(url, console=Console(file=sink, force_terminal=False), skip_confirm=True)
 
     installed = home / "skills" / "demo-bundle"
+    assert (installed / "references" / "guide.md").is_file()
     assert (installed / "references" / "guide.md").read_text() == "safe guide\n"
     assert (installed / "references" / "foo#bar.md").read_text() == "encoded delimiter\n"
     assert (installed / "references" / "my guide.md").read_text() == "encoded space\n"

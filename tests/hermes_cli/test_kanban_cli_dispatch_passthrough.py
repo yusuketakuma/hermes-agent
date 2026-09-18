@@ -23,10 +23,21 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
+    evicted = {}
     for mod in list(sys.modules.keys()):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            del sys.modules[mod]
-    yield test_home
+            evicted[mod] = sys.modules.pop(mod)
+    try:
+        yield test_home
+    finally:
+        # Restore the original module objects: tests run AFTER this fixture
+        # re-import fresh copies and patch their attributes (e.g. _kb._pid_alive),
+        # while modules imported at collection time still hold the originals —
+        # a stale split-brain makes those stubs land on the wrong instance.
+        for mod in list(sys.modules.keys()):
+            if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
+                del sys.modules[mod]
+        sys.modules.update(evicted)
 
 
 def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, monkeypatch):

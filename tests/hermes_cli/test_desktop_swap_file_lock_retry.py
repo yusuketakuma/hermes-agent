@@ -42,8 +42,14 @@ def test_swap_retries_transient_permission_error_then_promotes(tmp_path, monkeyp
     real_rename = os.rename
     locked = {"n": 0}
 
+    release_dir = desktop_dir / "release"
+    live_root = main_desktop._desktop_unpacked_root(live_exe, release_dir)
+    previous = live_root.parent / (live_root.name + main_desktop._DESKTOP_PREVIOUS_SUFFIX)
+
     def scanner_locked_rename(src, dst):
-        if Path(dst) == live_exe.parent and locked["n"] < 2:
+        # The promotion moves the live unpacked root aside (e.g.
+        # release/mac-arm64 -> .previous), not the exe's parent dir.
+        if Path(dst) == previous and locked["n"] < 2:
             locked["n"] += 1
             raise PermissionError(32, "being used by another process")
         return real_rename(src, dst)

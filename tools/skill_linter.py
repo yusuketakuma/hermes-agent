@@ -177,7 +177,10 @@ def _check_files(frontmatter: Dict[str, Any], skill_dir: Path) -> Iterator[LintF
                         f"skill ships '{fname}'; skills should not include scaffolding/config files.")
     refs_dir = skill_dir / "references"
     if refs_dir.is_dir():
-        n_refs = sum(1 for p in refs_dir.rglob("*.md") if not any(part.startswith("_") for part in p.parts))
+        n_refs = sum(
+            1 for p in refs_dir.rglob("*.md")
+            if not any(part.startswith("_") for part in p.relative_to(refs_dir).parts)
+        )
         if n_refs > _MAX_REFERENCE_FILES:
             yield _warn("references-sprawl",
                         f"{n_refs} files under references/; that is a per-session log, not topical depth. "

@@ -8,7 +8,7 @@ import pytest
 def test_worker_create_keeps_durable_origin(tmp_path, monkeypatch, linked, explicit):
     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_notify as kn
     from tools import kanban_tools as kt, async_delegation
-    from gateway.session_context import set_session_vars, clear_session_vars
+    from gateway.session_context import set_session_vars, clear_session_vars, reset_session_vars
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -36,6 +36,9 @@ def test_worker_create_keeps_durable_origin(tmp_path, monkeypatch, linked, expli
                             parents=[owner] if linked else [], session_id=explicit)))
     finally:
         clear_session_vars(tokens)
+        # clear leaves every var bound to "" (production semantics: mask stale
+        # os.environ); reset to _UNSET so later tests' env fallback still works.
+        reset_session_vars()
     assert result["ok"], result
     with kbc.connect_closing() as conn:
         child = kb.get_task(conn, result["task_id"])
@@ -50,7 +53,7 @@ def test_worker_create_keeps_durable_origin(tmp_path, monkeypatch, linked, expli
 def test_tool_subscription_captures_conversation_anchors(tmp_path, monkeypatch):
     from hermes_cli import kanban_db as kb, kanban_db_connect as kbc, kanban_db_notify as kn
     from tools import kanban_tools as kt
-    from gateway.session_context import set_session_vars, clear_session_vars
+    from gateway.session_context import set_session_vars, clear_session_vars, reset_session_vars
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
@@ -61,6 +64,7 @@ def test_tool_subscription_captures_conversation_anchors(tmp_path, monkeypatch):
         result = json.loads(kt._handle_create(dict(title="direct", assignee="default")))
     finally:
         clear_session_vars(tokens)
+        reset_session_vars()
     assert result["ok"], result
     with kbc.connect_closing() as conn:
         metadata = kn.list_notify_subs(conn, result["task_id"])[0]["delivery_metadata"]

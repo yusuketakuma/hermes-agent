@@ -192,8 +192,10 @@ class TestCleanupResetsEngineCache:
         # Seed the cache
         bt._cached_browser_engine = "lightpanda"
         bt._browser_engine_resolved = True
-        # cleanup should reset them
-        bt_lifecycle.cleanup_all_browsers()
+        # Sessions leaked by earlier tests hold real pids that cleanup would
+        # signal; the cache-reset contract under test doesn't need them.
+        with patch.object(bt_lifecycle, "cleanup_browser"):
+            bt_lifecycle.cleanup_all_browsers()
         assert bt._cached_browser_engine is None
         assert bt._browser_engine_resolved is False
 

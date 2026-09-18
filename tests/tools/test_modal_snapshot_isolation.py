@@ -121,6 +121,10 @@ def _install_modal_test_modules(
         _save_json_store=_save_json_store,
         _file_mtime_key=_file_mtime_key,
     )
+    sys.modules["tools.environments.remote_common"] = types.SimpleNamespace(
+        bash_argv=lambda cmd, login: ["bash", "-c", cmd],
+        ensure_lazy_dep=lambda feature: None,
+    )
     sys.modules["tools.interrupt"] = types.SimpleNamespace(is_interrupted=lambda: False)
     sys.modules["tools.credential_files"] = types.SimpleNamespace(
         get_credential_file_mounts=lambda: [],

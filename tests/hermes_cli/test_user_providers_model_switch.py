@@ -85,6 +85,9 @@ def test_list_authenticated_providers_enumerates_dict_format_models(monkeypatch)
             "name": "Local Ollama",
             "api": "http://localhost:11434/v1",
             "default_model": "minimax-m2.7:cloud",
+            # Hermetic: a live server on 11434 would answer the discovery probe
+            # with the host's real catalog instead of the declared models.
+            "discover_models": False,
             "models": {
                 "minimax-m2.7:cloud": {"context_length": 196608},
                 "kimi-k2.5:cloud": {"context_length": 200000},
@@ -521,6 +524,11 @@ def test_section3_probes_no_key_endpoint_with_singular_default_model(monkeypatch
     """
     monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
     monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+    # Hermetic: the native Ollama catalog path would probe a real server on
+    # 11434 and never reach the generic fetch_api_models stub below.
+    monkeypatch.setattr(
+        "hermes_cli.models_local.should_use_ollama_native_catalog",
+        lambda *a, **k: False)
 
     probed = {}
 

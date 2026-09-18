@@ -11,6 +11,7 @@ probe), not specific config snapshots.
 """
 
 import os
+import sys
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
@@ -233,7 +234,7 @@ class TestEmbeddedDaemonOverlayFlag:
         process.poll.return_value = None
         status = MagicMock(returncode=0)
 
-        with patch.object(
+        with patch.object(sys, "platform", "linux"), patch.object(
             cua_backend_driver,
             "_resolve_mcp_invocation",
             return_value=("/usr/bin/cua-driver", ["mcp"]),

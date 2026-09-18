@@ -27,6 +27,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
+import unittest.mock
 from pathlib import Path
 
 import pytest
@@ -668,19 +669,27 @@ def _close_leaked_session_dbs():
     try:
         from hermes_state_guard import _test_instance_registry as registry
     except Exception:
-        return
-    if not registry:
-        return
-    for db in list(registry):
-        if getattr(db, "_shared_registry_owned", False):
-            continue
-        try:
-            db.close()
-        except Exception:
-            # Teardown must never fail a passing test; a close that raises
-            # (cross-thread ProgrammingError, already-closed) leaves at most
-            # the one connection for the next sweep / process exit.
-            pass
+        registry = None
+    if registry:
+        for db in list(registry):
+            if getattr(db, "_shared_registry_owned", False):
+                continue
+            try:
+                db.close()
+            except Exception:
+                # Teardown must never fail a passing test; a close that raises
+                # (cross-thread ProgrammingError, already-closed) leaves at most
+                # the one connection for the next sweep / process exit.
+                pass
+    try:
+        import hermes_state_registry
+        hermes_state_registry.close_all()
+    except Exception:
+        # Same rule: a shared-connection teardown error must not fail the test.
+        # Without this sweep, acquire()d writers (one per test hermes_home)
+        # pile up as open state.db fds until select() refuses a high-numbered
+        # fd — the suite-wide "filedescriptor out of range" prompt hang.
+        pass
 
 
 @pytest.fixture(autouse=True)
@@ -711,6 +720,223 @@ def _neutralize_webbrowser(monkeypatch):
     monkeypatch.setattr(_webbrowser, "get", lambda *_args, **_kwargs: browser)
 
     return opened
+
+
+@pytest.fixture(autouse=True)
+def _reset_ambient_main_runtime():
+    """Clear the ambient main-runtime ContextVar between tests.
+
+    ``agent.auxiliary_client.set_runtime_main()`` is published once per real
+    agent turn (``turn_context._publish_runtime_main``) and binds a ContextVar
+    that nothing resets — under a shared pytest process every later
+    ``_normalize_main_runtime(None)`` reads a provider/model/api_key that
+    belongs to whichever earlier test ran an agent last. Production relies on
+    this being the *current session's* runtime; in the suite it is just leaked
+    state, so each test starts from "no live runtime" (tests that want one bind
+    it themselves via set_runtime_main / scoped_runtime_main / _read_main_*
+    patches).
+    """
+    try:
+        from agent.auxiliary_client import (
+            _RUNTIME_MAIN_CONTEXT, _publish_runtime_main_mirrors,
+        )
+    except Exception:
+        yield
+        return
+    token = _RUNTIME_MAIN_CONTEXT.set(None)
+    # The compat mirrors are a second ambient channel: set_runtime_main keeps
+    # them equal to the snapshot (invisible), but a later test patching only
+    # some mirror fields would expose the stale remainder as a live runtime.
+    # Re-baseline mirrors+snapshot together to preserve the invariant.
+    _publish_runtime_main_mirrors(("", "", "", "", "", ""))
+    try:
+        yield
+    finally:
+        try:
+            _RUNTIME_MAIN_CONTEXT.reset(token)
+        except (RuntimeError, ValueError):
+            pass  # copied contexts can't reset another task's token
+        _publish_runtime_main_mirrors(("", "", "", "", "", ""))
+
+
+@pytest.fixture(autouse=True)
+def _reset_gateway_session_vars():
+    """Reset ``gateway.session_context`` ContextVars between tests.
+
+    ``set_session_vars()``/``clear_session_vars()`` leave every var bound —
+    ``""`` is explicit "no session" (masks ``os.environ``), not ``_UNSET``
+    ("never bound here", env fallback allowed). A test that binds a session and
+    stops at ``clear_session_vars`` leaves every later ``get_session_env`` in
+    this process reading ``""`` instead of the env the next test sets — the
+    same leak class as ``_reset_ambient_main_runtime``. ``reset_session_vars``
+    restores ``_UNSET``; the process-level ``_session_context_engaged`` latch
+    stays (production: once any session binds the env bridge stays strict;
+    tests monkeypatch it directly when they need the pre-bind path).
+    """
+    def _reset():
+        try:
+            from gateway.session_context import reset_session_vars
+            reset_session_vars()
+        except Exception:
+            pass
+        # tools.approval_context keeps its own ContextVars (session key,
+        # observability ids, interactive flag) — a leaked session key makes
+        # later tests take background-dispatch paths meant for live turns.
+        try:
+            from tools import approval_context as _ac
+            for _var in (_ac._approval_session_key, _ac._approval_turn_id,
+                         _ac._approval_tool_call_id, _ac._approval_session_id,
+                         _ac._hermes_interactive_ctx):
+                _var.set(_var.default)
+        except Exception:
+            pass
+
+    _reset()
+    yield
+    _reset()
+
+
+# Top-level module roots owned by this repo. Matching on the root (not a
+# dotted prefix) also covers the bare package/module names themselves —
+# ``plugins`` (no dot) must be restored when a test swaps it for a bare
+# ModuleType, or ``plugins.web`` attribute resolution breaks downstream.
+_MODULE_ROOTS = frozenset({
+    "agent", "acp_adapter", "cron", "gateway", "hermes_cli", "plugins",
+    "tools", "tui_gateway", "toolset_distributions", "toolsets",
+    "model_tools", "run_agent", "cli", "batch_runner", "hermes_constants",
+    "hermes_logging", "hermes_bootstrap", "hermes_startup_watchdog",
+    "hermes_state", "hermes_time", "mcp_serve", "mini_swe_runner",
+    "registration_lifecycle", "trajectory_compressor", "utils",
+})
+
+# First-seen module object per name — the anchor ``_restore_reloaded_module_globals``
+# converges sys.modules back to after a test pops + re-imports an entry.
+_CANONICAL_MODULES: dict = {}
+
+
+@pytest.fixture(autouse=True)
+def _restore_reloaded_module_globals():
+    """Restore ``__dict__`` bindings of hermes modules tests ``importlib.reload``.
+
+    Reloading re-binds every module global to a NEW object in place — any test
+    file that imported a name earlier keeps the stale binding, so a later
+    ``patch.dict(stale_dict, ...)`` mutates an object the module's functions no
+    longer read (``test_explicit_solar_key_beats_the_family_default`` lost its
+    ``DEFAULT_CONTEXT_LENGTHS`` patch this way after a minimax-provider reload).
+
+    Snapshot every hermes module's bindings before each test; at teardown,
+    restore only modules whose namespace was broadly RE-BOUND (a reload —
+    >60% of names point at different objects). Few-name changes are ordinary
+    test mutations (``_reset_registry_for_tests`` clearing ``_SOURCES`` and
+    ``_BUILTINS_LOADED``) and must NOT be rolled back — restoring a flag while
+    its partner dict stays mutated in place manufactures an inconsistent
+    module state (~0.1ms snapshot cost for ~150 loaded modules).
+    """
+    import sys
+    # ``sys.modules`` can be mutated mid-iteration by a background thread's
+    # import (``dictionary changed size during iteration``) — retry a few
+    # times for a stable read rather than erroring the test at setup.
+    for _attempt in range(5):
+        try:
+            snaps = {
+                name: (mod, dict(mod.__dict__))
+                for name, mod in sys.modules.items()
+                if isinstance(name, str)
+                and name.partition(".")[0] in _MODULE_ROOTS
+                and hasattr(mod, "__dict__")
+            }
+            break
+        except RuntimeError:
+            if _attempt == 4:
+                raise
+    # Canonical module objects: the FIRST object ever seen under each name.
+    # A test that pops + re-imports a module leaves sys.modules pointing at a
+    # different object permanently (this fixture's per-test snapshot then
+    # anchors on the WRONG object and the split propagates). Anchoring on the
+    # first-seen object converges every test back to the module that
+    # collection-time ``import a.b as x`` / ``from a.b import y`` bound.
+    global _CANONICAL_MODULES
+    for name, (mod, _ns) in snaps.items():
+        _CANONICAL_MODULES.setdefault(name, mod)
+    yield
+    _MISS = object()
+    for name, (mod, namespace) in snaps.items():
+        canonical = _CANONICAL_MODULES.get(name, mod)
+        if sys.modules.get(name) is not canonical:
+            # A test popped the entry and something re-imported (or the entry
+            # vanished): later importers now see a DIFFERENT module object than
+            # collection-time importers — split-brain (test_save_url_image's
+            # un-restored hermes_constants pop leaked this way). Restore the
+            # canonical object so sys.modules is canonical again.
+            sys.modules[name] = canonical
+            # The re-import also re-pointed the PARENT package's attribute at
+            # the new module object (``import a.b`` binds ``a.b``); leaving it
+            # diverged makes ``import a.b as x`` resolve the new module while
+            # ``from a.b import y`` resolves the restored one (the split that
+            # broke test_terminal_breadcrumbs after test_state_db_guard).
+            parent_name, _, leaf = name.rpartition(".")
+            parent = sys.modules.get(parent_name)
+            if parent is not None and getattr(parent, leaf, None) is not canonical:
+                setattr(parent, leaf, canonical)
+            continue
+        if sys.modules.get(name) is not mod:
+            # Snapshot module was itself non-canonical — restore canonical.
+            sys.modules[name] = canonical
+        changed = sum(
+            1 for key, old in namespace.items()
+            if canonical.__dict__.get(key, _MISS) is not old
+        )
+        if changed > max(10, len(namespace) * 3 // 5):
+            canonical.__dict__.update(namespace)
+        else:
+            # Leaked unittest.mock.patch: an attribute that was a real object
+            # at setup but is now a Mock — e.g. a patch applied inside a
+            # thread whose ``with`` hadn't exited when the test ended
+            # (test_code_execution's _rpc_server_loop patch on
+            # model_tools.handle_function_call leaked this way). A Mock that
+            # is itself registered in ``sys.modules`` is a deliberately
+            # installed module double (test_google_chat's google.* fakes),
+            # not a leaked patch — leave it alone.
+            for key, old in namespace.items():
+                cur = canonical.__dict__.get(key, _MISS)
+                if (cur is not _MISS and cur is not old
+                        and isinstance(cur, unittest.mock.NonCallableMock)
+                        and not isinstance(old, unittest.mock.NonCallableMock)
+                        and not any(cur is v for v in sys.modules.values())):
+                    canonical.__dict__[key] = old
+    # Modules ABSENT at setup aren't in ``snaps`` — if a test re-imported one
+    # mid-test it lands as a fresh object diverged from canonical (and any
+    # collection-time importer). Restore those too.
+    for name, canonical in _CANONICAL_MODULES.items():
+        if name not in snaps and sys.modules.get(name) is not canonical:
+            sys.modules[name] = canonical
+            parent_name, _, leaf = name.rpartition(".")
+            parent = sys.modules.get(parent_name)
+            if parent is not None and getattr(parent, leaf, None) is not canonical:
+                setattr(parent, leaf, canonical)
+
+
+@pytest.fixture()
+def preserve_module_globals():
+    """Snapshot a module's ``__dict__`` on request; restore it at teardown.
+
+    ``importlib.reload(module)`` re-binds every module global to a NEW object
+    in place — any test file that imported a name earlier (e.g.
+    ``from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS``) keeps the
+    stale binding, so a later ``patch.dict(stale_dict, ...)`` mutates an object
+    the module's functions no longer read. Snapshot before the reload and this
+    fixture puts the original objects back afterwards, so post-test readers
+    see the same objects importers captured.
+    """
+    saved: list = []
+
+    def _snap(module) -> None:
+        saved.append((module, dict(module.__dict__)))
+
+    yield _snap
+
+    for module, namespace in saved:
+        module.__dict__.update(namespace)
 
 
 @pytest.fixture(autouse=True)
@@ -934,7 +1160,11 @@ def _reset_tui_gateway_server_state():
     yield
 
     mod = sys.modules.get(_TUI_SERVER_MODULE)
-    if mod is None:
+    # A test may swap the whole sys.modules entry for a non-module double via
+    # ``monkeypatch.setitem`` — this finalizer can run before that undo, so a
+    # stub without the server globals must be skipped the same way the
+    # non-dict doubles below are.
+    if mod is None or not hasattr(mod, "_methods"):
         return
 
     # This finalizer can run before the test's own monkeypatch undo, so a

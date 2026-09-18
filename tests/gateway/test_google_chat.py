@@ -1635,6 +1635,10 @@ class TestSupervisorReconnect:
             raise RuntimeError("stream died")
         adapter._subscriber.subscribe = _fail
 
+        # Google modules load lazily on first adapter use — the supervisor's
+        # fatal-class dict needs gax_exceptions populated (sys.modules doubles
+        # resolve), so force the load before running it.
+        _gc_mod._load_google_modules()
         # Keep the test fast — run supervisor until it exhausts retries.
         await adapter._run_supervisor()
         assert adapter.has_fatal_error is True
@@ -1813,6 +1817,9 @@ class TestGoogleChatStandaloneSend:
         fake_creds.token = "the-token"
         fake_creds.refresh = MagicMock(return_value=None)
 
+        # Google modules load lazily on first adapter use — populate the module
+        # globals (the sys.modules doubles resolve) before patching them.
+        _gc_mod._load_google_modules()
         original = _gc_mod.service_account.Credentials.from_service_account_info
         _gc_mod.service_account.Credentials.from_service_account_info = MagicMock(
             return_value=fake_creds

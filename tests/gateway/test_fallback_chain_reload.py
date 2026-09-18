@@ -85,6 +85,9 @@ def test_background_and_main_agent_paths_call_refresh():
     _refresh_calls = (
         source.count("fallback_model=self._refresh_fallback_model()")
         + source.count("fallback_model=self._runner._refresh_fallback_model()")
+        # allow_fallback=False turns pass None instead; the else-branch still refreshes.
+        + source.count("else self._runner._refresh_fallback_model()")
+        + source.count("else self._refresh_fallback_model()")
     )
     assert _refresh_calls >= 2
     # The cached-agent reuse path (the load-bearing fix for a long-lived

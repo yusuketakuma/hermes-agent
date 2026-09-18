@@ -28,6 +28,9 @@ _NON_MIRROR_DIRS = {
     "fakes", "fixtures", "honcho_plugin", "install", "integration", "manual",
     "monitoring", "openviking_plugin", "perf_guards", "scripts", "secret_sources",
     "security", "skills", "verify", "website", "computer_use", "hermes_state",
+    # Local org tooling: tests for scripts that live in the ~/.hermes
+    # workspace outside this repo (e.g. scripts/jarvis/system_scan.py).
+    "jarvis",
 }
 
 # Root-level modules whose tests sit directly in tests/ (no package to mirror).

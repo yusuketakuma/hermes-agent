@@ -73,13 +73,14 @@ def _install_fake_google_auth(monkeypatch, *, adc_ok=True, adc_project="adc-proj
 
 
 @pytest.fixture
-def vertex_adapter(monkeypatch):
+def vertex_adapter(monkeypatch, preserve_module_globals):
     """Fresh vertex_adapter with a fake google-auth and clean caches/env."""
     for var in ("VERTEX_CREDENTIALS_PATH", "GOOGLE_APPLICATION_CREDENTIALS",
                 "VERTEX_PROJECT_ID", "VERTEX_REGION", "GOOGLE_CLOUD_PROJECT"):
         monkeypatch.delenv(var, raising=False)
     _install_fake_google_auth(monkeypatch)
     import agent.vertex_adapter as va
+    preserve_module_globals(va)
     va = importlib.reload(va)
     va._creds_cache.clear()
     # Neutralize config.yaml by default; individual tests re-patch _vertex_config.

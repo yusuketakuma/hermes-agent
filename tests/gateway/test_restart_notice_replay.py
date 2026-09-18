@@ -31,6 +31,15 @@ def _adapter():
 def boot_notice(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    # Discord sends are allowlisted by discord.server_targets; the home channel
+    # must be a configured target for the notice to leave the gateway.
+    (tmp_path / "config.yaml").write_text(
+        "discord:\n"
+        "  server_targets:\n"
+        "    - guild_id: 'unit-test-guild'\n"
+        "      channel_ids: ['unit-test-home']\n",
+        encoding="utf-8",
+    )
     # Await the boot task to completion and propagate failures deterministically.
     monkeypatch.setattr(gateway_run, "_startup_restore_drain_timeout_secs", lambda: 0)
     runner = object.__new__(gateway_run.GatewayRunner)

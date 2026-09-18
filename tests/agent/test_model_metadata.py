@@ -1684,10 +1684,11 @@ class TestGrok43StaleCacheGuard:
         # Non-listed slugs are untouched even at low cached values.
         assert not _stale_pre_catalog_cache_entry("grok-4", 256_000)
 
-    def test_stale_grok_4_3_dropped_and_reresolves_to_1m(self, tmp_path, monkeypatch):
+    def test_stale_grok_4_3_dropped_and_reresolves_to_1m(self, tmp_path, monkeypatch, preserve_module_globals):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         import importlib
         import agent.model_metadata as mm
+        preserve_module_globals(mm)
         importlib.reload(mm)
         base = "https://api.x.ai/v1"
         mm.save_context_length("grok-4.3", base, 256_000)
@@ -1697,10 +1698,11 @@ class TestGrok43StaleCacheGuard:
         assert ctx == 1_000_000
 
 
-    def test_grok_4_not_clobbered(self, tmp_path, monkeypatch):
+    def test_grok_4_not_clobbered(self, tmp_path, monkeypatch, preserve_module_globals):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         import importlib
         import agent.model_metadata as mm
+        preserve_module_globals(mm)
         importlib.reload(mm)
         base = "https://api.x.ai/v1"
         # 256,000 is the CORRECT value for plain grok-4 — guard must not touch it.
@@ -1743,10 +1745,11 @@ class TestGrok46StaleCacheGuard:
         assert not _stale_pre_catalog_cache_entry("grok-4", 256_000)
         assert not _stale_pre_catalog_cache_entry("grok-4.5", 500_000)
 
-    def test_stale_grok_4_6_dropped_and_reresolves_to_500k(self, tmp_path, monkeypatch):
+    def test_stale_grok_4_6_dropped_and_reresolves_to_500k(self, tmp_path, monkeypatch, preserve_module_globals):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         import importlib
         import agent.model_metadata as mm
+        preserve_module_globals(mm)
         importlib.reload(mm)
         base = "https://api.x.ai/v1"
         mm.save_context_length("grok-4.6", base, 256_000)
@@ -1794,10 +1797,11 @@ class TestGenericPreCatalogStaleGuard:
         assert not _stale_pre_catalog_cache_entry("totally-unknown-model", 4096)
         assert not _stale_pre_catalog_cache_entry("minimax", 204_800)
 
-    def test_stale_qwen36_plus_dropped_and_reresolves(self, tmp_path, monkeypatch):
+    def test_stale_qwen36_plus_dropped_and_reresolves(self, tmp_path, monkeypatch, preserve_module_globals):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         import importlib
         import agent.model_metadata as mm
+        preserve_module_globals(mm)
         importlib.reload(mm)
         base = "https://dashscope.aliyuncs.com/compatible-mode/v1"
         mm.save_context_length("qwen3.6-plus", base, 131_072)

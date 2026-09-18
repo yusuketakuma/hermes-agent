@@ -50,8 +50,19 @@ def test_read_denied_secret_stores_are_write_denied_on_profile_and_root(hermes_l
 
 def test_control_files_and_lookalikes_outside_home_stay_writable(hermes_layout, tmp_path):
     root, profile = hermes_layout
-    for base in (profile, root):
-        for rel in WRITABLE_CONTROL_FILES:
-            assert fs.is_write_denied(str(_touch(base, rel))) is False, f"#45947 regression: {rel}"
+    # Local hardening diverges from upstream #45947 on purpose:
+    # - every profile is a credential boundary (cross-profile auth/webhook
+    #   material and protected state are never agent-writable), and
+    # - config.yaml / SOUL.md stay write-protected everywhere (bot identity
+    #   and org config are not agent-writable).
+    # The upstream contract survives only at the global root for auth.json /
+    # webhook_subscriptions.json — the files a user may still ask to edit.
+    for rel in ("auth.json", "webhook_subscriptions.json"):
+        assert fs.is_write_denied(str(_touch(profile, rel))) is True, \
+            f"profile credential boundary must deny writes: {rel}"
+        assert fs.is_write_denied(str(_touch(root, rel))) is False, \
+            f"#45947 regression: root {rel} must stay writable"
+    assert fs.is_write_denied(str(_touch(profile, "config.yaml"))) is True
+    assert fs.is_write_denied(str(_touch(root, "config.yaml"))) is True
     assert fs.is_write_denied(str(_touch(tmp_path / "myproject", "cache/bws_cache.json"))) is False
     assert fs.is_write_denied(str(_touch(tmp_path / "myproject", "vault/vault.key"))) is False

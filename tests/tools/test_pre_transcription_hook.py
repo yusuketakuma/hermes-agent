@@ -114,7 +114,8 @@ class TestPromptThreading:
              patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
              patch("tools.transcription_tools._load_local_whisper_model",
                    return_value=mock_model), \
-             patch("tools.transcription_tools._local_model", None):
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None):
             result = transcription_tools.transcribe_audio(audio)
 
         assert result["success"] is True
@@ -621,7 +622,8 @@ def test_real_fixture_plugins_thread_prompt_in_registration_order(
              patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
              patch("tools.transcription_tools._load_local_whisper_model",
                    return_value=mock_model), \
-             patch("tools.transcription_tools._local_model", None):
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None):
             result = transcription_tools.transcribe_audio(audio)
     finally:
         plugins_mod._plugin_manager = old_manager

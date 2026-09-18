@@ -413,8 +413,10 @@ class TestDelegateTask(unittest.TestCase):
                 child_db = kwargs["session_db"]
                 self.assertIsInstance(child_db, SessionDB)
                 self.assertIsNot(child_db, parent_db)
+                # db_path is canonicalized on open (macOS /var -> /private/var).
                 self.assertEqual(
-                    str(child_db.db_path), str(parent_db.db_path)
+                    os.path.realpath(child_db.db_path),
+                    os.path.realpath(parent_db.db_path),
                 )
             finally:
                 if child_db is not None:

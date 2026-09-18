@@ -2748,9 +2748,6 @@ class GatewayTurnMixin:
         stream_task = asyncio.create_task(_stream_consumer.run()) if _stream_consumer else None
 
         _adapter = self._adapter_for_source(source)
-        if _adapter and not scheduled_heartbeat:
-            with suppress(Exception):
-                await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
 
         full_response = ""
         _start = time.time()
@@ -2780,6 +2777,9 @@ class GatewayTurnMixin:
             return False
 
         try:
+            if _adapter and not scheduled_heartbeat:
+                with suppress(Exception):
+                    await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
             # sock_connect bounds the TCP connect phase so an unreachable proxy host
             # (DNS fail, firewall, remote down) fails fast instead of hanging on the OS default.
             _timeout = ClientTimeout(total=0, sock_read=1800, sock_connect=30)

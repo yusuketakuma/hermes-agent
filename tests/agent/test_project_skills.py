@@ -61,10 +61,10 @@ class TestFindProjectRoot:
         monkeypatch.chdir(d)
         assert su.find_project_root(start=d) is None
 
-    def test_walks_up_from_subdir(self, project_env):
+    def test_walks_up_from_subdir(self, project_env, monkeypatch):
         sub = project_env["repo"] / "a" / "b"
         sub.mkdir(parents=True)
-        os.chdir(sub)
+        monkeypatch.chdir(sub)
         assert su.find_project_root() == project_env["repo"].resolve()
 
 

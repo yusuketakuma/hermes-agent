@@ -404,11 +404,12 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
                 t.join()
         self.assertEqual([r["status"] for r in results], ["success"] * 6)
         self.assertEqual(len(_KERNELS), 1)
+        # BSD pgrep has no -c (GNU procps only) — list and count lines instead.
         live = subprocess.run(
-            ["pgrep", "-fc", "-P", str(os.getpid()), "hermes_kernel_runner"],
+            ["pgrep", "-fl", "-P", str(os.getpid()), "hermes_kernel_runner"],
             capture_output=True, text=True,
-        ).stdout.strip()
-        self.assertEqual(live, "1")
+        ).stdout.strip().splitlines()
+        self.assertEqual(len([ln for ln in live if ln.strip()]), 1)
 
 
 class TestPerCellRpcAuthority(unittest.TestCase):

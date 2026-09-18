@@ -169,7 +169,10 @@ def test_interrupt_kills_hook_and_propagates(tmp_path):
 
     def interrupt_once_running():
         """Interrupt only once the hook is up, so the signal lands inside _spawn."""
-        deadline = time.monotonic() + 5.0
+        # Under a loaded full-suite run the bash spawn + marker write can take
+        # far longer than a standalone run — a 5s budget expiring leaves the
+        # hook sleeping 300s and _spawn returning normally (no KeyboardInterrupt).
+        deadline = time.monotonic() + 60.0
         while time.monotonic() < deadline:
             if marker.exists() and marker.read_text().strip():
                 os.kill(os.getpid(), signal.SIGINT)

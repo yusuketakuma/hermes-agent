@@ -368,7 +368,10 @@ class TestFirstSigwinchBaseline:
         monkeypatch.setattr(
             cli_mod.shutil,
             "get_terminal_size",
-            lambda _default: os_mod.terminal_size((97, 40)),
+            # shutil.get_terminal_size is the REAL module attr — pytest's own
+            # terminal writer also calls it (with the fallback= kwarg) while
+            # the patch is live, so the fake must accept the real signature.
+            lambda *a, **k: os_mod.terminal_size((97, 40)),
         )
 
         bare_cli._install_resize_recovery(app)
@@ -381,8 +384,14 @@ class TestFirstSigwinchBaseline:
         app = MagicMock()
         app.output.get_size.side_effect = RuntimeError("not attached")
 
-        def _boom(_default):
-            raise RuntimeError("no tty")
+        def _boom(*a, **k):
+            # Raise only for the production call shape (positional fallback
+            # tuple). pytest's own terminal writer calls
+            # get_terminal_size(fallback=...) while this patch is live; it must
+            # still get a sane answer or the run dies with INTERNALERROR.
+            if a:
+                raise RuntimeError("no tty")
+            return os.terminal_size(k.get("fallback", (80, 24)))
 
         monkeypatch.setattr(cli_mod.shutil, "get_terminal_size", _boom)
 

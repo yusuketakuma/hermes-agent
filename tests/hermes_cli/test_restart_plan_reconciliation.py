@@ -9,6 +9,8 @@ Pins:
   rows — the silent-miss tripwire.
 """
 
+import sys
+
 from hermes_cli.update_inventory import (
     RuntimeRecord,
     UpdatePlan,
@@ -332,7 +334,11 @@ def test_unaccounted_serve_report_names_serve_remedy_not_gateway_restart(capsys)
     assert report_unaccounted_runtimes(outcomes) is True
     out = capsys.readouterr().out
     assert "serve [default] pid 900" in out
-    assert "hermes-serve.service" in out
+    # The systemctl remedy line is linux-only; other platforms get the relaunch hint.
+    if sys.platform == "linux":
+        assert "hermes-serve.service" in out
+    else:
+        assert "relaunch `hermes serve`" in out
     assert "hermes gateway restart" not in out
 
 

@@ -519,7 +519,7 @@ def test_active_pr_guard_lifts_for_profile_handed_the_card_after_the_pr(
         closer_id = kb.create_task(conn, title="closer recovery", assignee="dev")
         kb.add_comment(conn, closer_id, author="dev", body=pr_comment)
         _backdate_comments(conn, closer_id)
-        assert kb.assign_task(conn, closer_id, "closer") is True
+        assert kb.assign_task(conn, closer_id, "closer", allow_scope_rebind=True) is True
 
         assert kbd.check_respawn_guard(conn, dev_id) == "active_pr"
         assert kbd.check_respawn_guard(conn, closer_id) is None
@@ -569,7 +569,7 @@ def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
         assert tid not in [s[0] for s in res.spawned]
 
         # A real handoff after all of that still lifts the guard.
-        assert kb.assign_task(conn, tid, "closer") is True
+        assert kb.assign_task(conn, tid, "closer", allow_scope_rebind=True) is True
         assert kbd.check_respawn_guard(conn, tid) is None
 
 

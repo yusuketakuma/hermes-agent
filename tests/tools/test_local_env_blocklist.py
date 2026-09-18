@@ -972,16 +972,17 @@ class TestPythonpathSelectiveStrip:
         user_b = "/opt/project/lib"
         captured = {}
 
+        class _Captured(Exception):
+            pass
+
         def _fake_popen(cmd, **kwargs):
             captured["env"] = kwargs.get("env", {})
             captured["staging"] = os.path.dirname(cmd[1])
-            proc = MagicMock()
-            proc.stdout.read.return_value = b""
-            proc.stderr.read.return_value = b""
-            proc.wait.return_value = 0
-            proc.returncode = 0
-            proc.poll.return_value = 0
-            return proc
+            # Abort the spawn after capture: returning a MagicMock proc
+            # would leave the session kernel's reader threads spinning on
+            # mock read1()s forever (always-on kernels stay registered past
+            # the patch's lifetime).
+            raise _Captured()
 
         with patch("tools.code_execution_tool._load_config",
                    return_value={"mode": "strict"}), \
@@ -994,7 +995,12 @@ class TestPythonpathSelectiveStrip:
                  "PYTHONPATH": os.pathsep.join(
                      [hermes_root, venv_sp, user_a, user_b]),
              }):
-            execute_code(code="pass", task_id="test-int", enabled_tools=[])
+            try:
+                execute_code(code="pass", task_id="test-int", enabled_tools=[])
+            except _Captured:
+                pass  # expected: spawn aborted right after env capture
+            except Exception:
+                pass  # kernel path wraps the abort; capture already happened
 
         assert "PYTHONPATH" in captured["env"], \
             "execute_code never reached Popen"

@@ -81,16 +81,27 @@ def http_server(tmp_path, monkeypatch):
 
     # Force the constants/image cache helpers to re-read HERMES_HOME.
     import sys
+    evicted = {}
     for mod in list(sys.modules):
         if mod.startswith("hermes_constants") or mod.startswith("agent.image_gen_provider"):
-            sys.modules.pop(mod, None)
+            evicted[mod] = sys.modules.pop(mod)
 
     httpd = socketserver.TCPServer(("127.0.0.1", 0), _TinyImageHandler)
     port = httpd.server_address[1]
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
-    yield f"http://127.0.0.1:{port}", httpd
-    httpd.shutdown()
+    try:
+        yield f"http://127.0.0.1:{port}", httpd
+    finally:
+        httpd.shutdown()
+        # Restore the original module objects: anything imported DURING the
+        # test re-created fresh copies, and leaving them in sys.modules splits
+        # module identity — later tests' set_hermes_home_override lands on the
+        # fresh module while older importers still read the original's ContextVar.
+        for mod in list(sys.modules):
+            if mod in evicted:
+                del sys.modules[mod]
+        sys.modules.update(evicted)
 
 
 class TestSaveUrlImage:

@@ -15,8 +15,13 @@ import pytest
 
 @pytest.fixture
 def adapter_mod():
-    sys.modules.pop("plugins.platforms.discord.adapter", None)
-    return importlib.import_module("plugins.platforms.discord.adapter")
+    original = sys.modules.pop("plugins.platforms.discord.adapter", None)
+    try:
+        yield importlib.import_module("plugins.platforms.discord.adapter")
+    finally:
+        sys.modules.pop("plugins.platforms.discord.adapter", None)
+        if original is not None:
+            sys.modules["plugins.platforms.discord.adapter"] = original
 
 
 def _seed(adapter_mod, yaml_cfg, discord_cfg):
