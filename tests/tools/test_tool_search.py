@@ -587,7 +587,7 @@ class TestRegression_OpenClawCron84141:
             "arguments": {"command": "echo hi"},
         })
         assert err is not None
-        assert "not a deferrable" in err
+        assert "directly-listed tool" in err and "call it directly" in err.lower()
 
 
 class TestRegression_ToolsetScoping:

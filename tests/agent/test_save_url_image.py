@@ -75,8 +75,16 @@ class _TinyImageHandler(http.server.BaseHTTPRequestHandler):
 
 @pytest.fixture
 def http_server(tmp_path, monkeypatch):
-    """Spin up a localhost HTTP server and isolate HERMES_HOME under tmp_path."""
+    """Spin up a localhost HTTP server and isolate HERMES_HOME under tmp_path.
+
+    ``HERMES_ALLOW_PRIVATE_URLS`` opts the loopback test server into private-IP
+    reach (the same toggle a LAN-hosted provider would set) — save_url now
+    refuses private targets by default.
+    """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_ALLOW_PRIVATE_URLS", "1")
+    from tools import url_safety
+    url_safety._reset_allow_private_cache()
     (tmp_path / ".hermes").mkdir()
 
     # Force the constants/image cache helpers to re-read HERMES_HOME.
@@ -94,6 +102,8 @@ def http_server(tmp_path, monkeypatch):
         yield f"http://127.0.0.1:{port}", httpd
     finally:
         httpd.shutdown()
+        monkeypatch.delenv("HERMES_ALLOW_PRIVATE_URLS", raising=False)
+        url_safety._reset_allow_private_cache()
         # Restore the original module objects: anything imported DURING the
         # test re-created fresh copies, and leaving them in sys.modules splits
         # module identity — later tests' set_hermes_home_override lands on the
@@ -118,18 +128,14 @@ class TestSaveUrlImage:
         assert "cache/images" in str(path)
         assert path.suffix == ".png"
 
-
-
-
     def test_404_raises(self, http_server):
         """HTTP errors must propagate — caller decides whether to fall back."""
         base, _ = http_server
         from agent.image_gen_provider import save_url_image
-        import requests as req_lib
+        import httpx
 
-        with pytest.raises(req_lib.HTTPError):
+        with pytest.raises(httpx.HTTPStatusError):
             save_url_image(f"{base}/404")
-
 
     def test_oversize_raises_and_cleans_up(self, http_server, tmp_path):
         """Oversize downloads must NOT leak a partial file into the cache."""

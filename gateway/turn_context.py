@@ -63,6 +63,7 @@ class TurnContext:
     # Optional trusted, per-turn routing policy from an adapter/plugin. Never persisted in the session.
     turn_policy: Optional[dict] = None
     user_config: Any = None
+    mute_notification_reply: bool = False
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None
     log_mode_enabled: bool = False

@@ -337,8 +337,7 @@ def test_unaccounted_serve_report_names_serve_remedy_not_gateway_restart(capsys)
     # The systemctl remedy line is linux-only; other platforms get the relaunch hint.
     if sys.platform == "linux":
         assert "hermes-serve.service" in out
-    else:
-        assert "relaunch `hermes serve`" in out
+    assert "relaunch `hermes serve`" in out
     assert "hermes gateway restart" not in out
 
 
