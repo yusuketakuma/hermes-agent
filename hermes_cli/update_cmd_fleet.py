@@ -171,6 +171,31 @@ def _receipt_owed_gateways() -> set[tuple[str, str]] | None:
     return owed
 
 
+def _code_sha_covers(row_sha: object, expected_sha: str) -> bool:
+    """``row_sha`` serves ``expected_sha``'s code: exact match, or a descendant of it.
+
+    A gateway restarted onto a checkout NEWER than the receipt's pulled sha still
+    fulfills the obligation — exact equality cannot see that the newer code contains
+    the pulled commits (same false-positive class as ``_marker_only_restart_obsolete``,
+    one level down). Conservative on any resolution failure: missing sha, an
+    unresolvable ref, or a failed probe all answer not-covered.
+    """
+    sha = str(row_sha or "")
+    if not sha:
+        return False
+    if sha == expected_sha:
+        return True
+    try:
+        from hermes_cli.update_cmd import _m
+        return subprocess.run(
+            ["git", "-C", str(_m().PROJECT_ROOT), "merge-base", "--is-ancestor", expected_sha, sha],
+            capture_output=True,
+            timeout=10,
+        ).returncode == 0
+    except Exception:
+        return False
+
+
 def _live_fleet_covers_receipt(expected_sha: str | None, *, accept_states: tuple = ("current",)) -> bool:
     """Require current successors for every recorded runtime, not just any live row.
 
@@ -192,7 +217,7 @@ def _live_fleet_covers_receipt(expected_sha: str | None, *, accept_states: tuple
         # ``stale`` too: the row's stamped ``code_sha`` is the identity that matters there.
         # ``unknown``/``down`` rows never cover.
         if not fleet or any(
-            row.get("state") not in accept_states or row.get("code_sha") != expected_sha
+            row.get("state") not in accept_states or not _code_sha_covers(row.get("code_sha"), expected_sha)
             for row in fleet
         ):
             return False
