@@ -1335,6 +1335,12 @@ class TestMultiAgentRouting:
     def test_path_routed_agent_card_uses_prefix_and_canonical_path(self, monkeypatch):
         from plugins.platforms.a2a.adapter import A2AAdapter
         from gateway.config import PlatformConfig
+        from tools.registry import registry
+
+        # Agent-card assertions must not depend on which provider tests ran
+        # before this case and populated the process-global registry.
+        monkeypatch.setattr(registry, "get_registered_toolset_names", lambda: ["research", "web"])
+        monkeypatch.setattr(registry, "get_tool_names_for_toolset", lambda _toolset: [])
 
         adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
             "agents": {
