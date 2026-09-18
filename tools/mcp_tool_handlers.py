@@ -6,6 +6,8 @@ import asyncio
 import contextvars
 import inspect
 import json
+import os
+import re
 import time
 from contextlib import asynccontextmanager
 from functools import partial
@@ -357,6 +359,57 @@ async def _track_inflight_rpc(server: Any, server_name: str, op: str, *, retry_s
             inflight.discard(task)
 
 
+_MCP_SESSION_IDENTITY_SOURCES = frozenset({"HERMES_SESSION_USER_ID"})
+_MCP_SESSION_IDENTITY_FIELDS = frozenset(
+    {
+        "approved_by", "issued_by", "imported_by", "prepared_by", "updated_by",
+        "created_by", "converted_by", "corrected_by", "archived_by",
+        "configured_by", "closed_by", "reopened_by", "retried_by", "sent_by",
+        "added_by", "synced_by", "linked_by", "completed_by", "cancelled_by",
+        "rejected_by", "finalized_by", "merged_by", "recorded_by", "revoked_by",
+        "accessed_by",
+    }
+)
+
+
+def _prepare_mcp_call(config: dict, arguments: dict | None) -> tuple[dict, dict | None]:
+    """Bind configured write arguments to the current Hermes session."""
+    normalized = dict(arguments or {})
+    identity = config.get("session_identity") if isinstance(config, dict) else None
+    if not isinstance(identity, dict):
+        return normalized, None
+
+    source = str(identity.get("source", "HERMES_SESSION_USER_ID")).strip()
+    if source not in _MCP_SESSION_IDENTITY_SOURCES:
+        logger.warning("Ignoring unsupported MCP session identity source %r", source)
+        return normalized, None
+
+    try:
+        from gateway.session_context import get_session_env
+
+        actor = get_session_env(source, "").strip()
+    except Exception:
+        actor = os.environ.get(source, "").strip()
+    if not actor:
+        return normalized, None
+
+    meta_key = str(identity.get("meta_key", "hermes_session_user_id")).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", meta_key):
+        logger.warning("Ignoring invalid MCP session identity metadata key")
+        return normalized, None
+
+    fields = identity.get("argument_fields", sorted(_MCP_SESSION_IDENTITY_FIELDS))
+    if isinstance(fields, str):
+        fields = [fields]
+    if not isinstance(fields, (list, tuple, set)):
+        fields = sorted(_MCP_SESSION_IDENTITY_FIELDS)
+    for field in fields:
+        field_name = str(field)
+        if field_name in _MCP_SESSION_IDENTITY_FIELDS:
+            normalized[field_name] = actor
+    return normalized, {meta_key: actor}
+
+
 async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str, args: dict):
     """``session.call_tool`` that fails fast when the stdio child is/gets dead: pre-call (a dead
     child must not hold the slot for the full timeout) and mid-call (race against
@@ -371,7 +424,9 @@ async def _call_tool_racing_stdio_death(server, server_name: str, tool_name: str
             f"MCP stdio subprocess for '{server_name}' had already exited when the call was dispatched",
             in_flight=False,
         )
-    _call_coro = server.session.call_tool(tool_name, arguments=args)
+    call_arguments, request_meta = _prepare_mcp_call(getattr(server, "_config", {}), args)
+    call_kwargs = {"meta": request_meta} if request_meta is not None else {}
+    _call_coro = server.session.call_tool(tool_name, arguments=call_arguments, **call_kwargs)
     _watch_children = getattr(server, "_watch_stdio_children", None)
     if not (inspect.iscoroutinefunction(_watch_children) and asyncio.iscoroutine(_call_coro)):
         # Stubbed sessions return a non-awaitable, or there is no child-watcher to race: plain await.

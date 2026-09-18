@@ -1520,6 +1520,25 @@ class TestBuildSafeEnv:
         assert "SECRET_KEY" not in result
         assert "AWS_ACCESS_KEY_ID" not in result
 
+    def test_context_hermes_home_is_passed_without_leaking_other_env(self, monkeypatch):
+        """MCP children use the active profile's home, not the process home."""
+        from tools.mcp_tool_config import _build_safe_env
+
+        monkeypatch.setattr(
+            "hermes_constants.get_hermes_home_override",
+            lambda: "/tmp/hermes-profile",
+        )
+        fake_env = {
+            "PATH": "/usr/bin",
+            "HERMES_HOME": "/tmp/process-home",
+            "FINANCE_SECRET": "must-not-appear",
+        }
+        with patch.dict("os.environ", fake_env, clear=True):
+            result = _build_safe_env(None)
+
+        assert result["HERMES_HOME"] == "/tmp/hermes-profile"
+        assert "FINANCE_SECRET" not in result
+
     def test_secret_vars_excluded(self):
         """Sensitive env vars from os.environ are NOT passed through."""
         from tools.mcp_tool_config import _build_safe_env
@@ -1541,6 +1560,85 @@ class TestBuildSafeEnv:
         assert "OPENAI_API_KEY" not in result
         assert "DATABASE_URL" not in result
         assert "API_SECRET" not in result
+
+    def test_session_identity_is_attached_only_when_configured(self, monkeypatch):
+        """Configured MCP servers receive the current session actor per call."""
+        from tools.mcp_tool_handlers import _prepare_mcp_call
+
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": (
+                "discord-user-42" if name == "HERMES_SESSION_USER_ID" else default
+            ),
+        )
+        config = {
+            "session_identity": {
+                "source": "HERMES_SESSION_USER_ID",
+                "meta_key": "hermes_session_user_id",
+                "argument_fields": ["approved_by", "issued_by"],
+            }
+        }
+
+        arguments, meta = _prepare_mcp_call(
+            config,
+            {"invoice_id": "finv_1", "approved_by": "spoofed"},
+        )
+
+        assert arguments["approved_by"] == "discord-user-42"
+        assert meta == {"hermes_session_user_id": "discord-user-42"}
+
+    def test_session_identity_is_not_sent_to_unconfigured_servers(self, monkeypatch):
+        from tools.mcp_tool_handlers import _prepare_mcp_call
+
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": "discord-user-42",
+        )
+
+        arguments, meta = _prepare_mcp_call(
+            {},
+            {"invoice_id": "finv_1", "approved_by": "spoofed"},
+        )
+
+        assert arguments["approved_by"] == "spoofed"
+        assert meta is None
+
+    def test_session_identity_binds_calendar_and_billing_run_writes(self, monkeypatch):
+        """Schedule-derived billing writes must use the authenticated actor."""
+        from tools.mcp_tool_handlers import _prepare_mcp_call
+
+        monkeypatch.setattr(
+            "gateway.session_context.get_session_env",
+            lambda name, default="": (
+                "discord-user-42" if name == "HERMES_SESSION_USER_ID" else default
+            ),
+        )
+        config = {
+            "session_identity": {
+                "source": "HERMES_SESSION_USER_ID",
+                "meta_key": "hermes_session_user_id",
+                "argument_fields": [
+                    "synced_by",
+                    "linked_by",
+                    "completed_by",
+                    "cancelled_by",
+                    "finalized_by",
+                ],
+            }
+        }
+
+        arguments, meta = _prepare_mcp_call(
+            config,
+            {
+                "connection_id": "cal_1",
+                "synced_by": "spoofed",
+                "finalized_by": "spoofed",
+            },
+        )
+
+        assert arguments["synced_by"] == "discord-user-42"
+        assert arguments["finalized_by"] == "discord-user-42"
+        assert meta == {"hermes_session_user_id": "discord-user-42"}
 
     def test_secret_source_injected_vars_are_passed(self, monkeypatch):
         """Vars tagged by an external secret source (Bitwarden/1Password) are

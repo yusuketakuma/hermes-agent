@@ -129,6 +129,19 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
             env[key] = os.environ[key]
     if user_env:
         env.update(user_env)
+    # MCP servers are long-lived children, while a gateway request may be
+    # scoped to a different Hermes profile through a ContextVar.  Propagate
+    # that request-local home explicitly; otherwise a server that reads
+    # HERMES_HOME from its process environment can write into the default
+    # profile even though the caller is operating in another profile.
+    try:
+        from hermes_constants import get_hermes_home_override
+
+        home_override = get_hermes_home_override()
+        if home_override:
+            env["HERMES_HOME"] = home_override
+    except Exception:  # pragma: no cover - bootstrap/import fallback
+        pass
     from agent.delegation_context import delegated_child_subprocess_env
     return delegated_child_subprocess_env(env)
 
