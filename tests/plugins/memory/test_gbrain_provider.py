@@ -55,6 +55,14 @@ def test_sync_turn_writes_a_hashed_conversation_page(provider_module, monkeypatc
         return SimpleNamespace(returncode=0, stdout=b'{"status":"inserted"}', stderr=b"")
 
     monkeypatch.setattr(provider_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        provider_module,
+        "_load_provider_config",
+        lambda hermes_home: {"auto_capture": True},
+    )
+    monkeypatch.setattr(
+        provider_module, "_find_binary", lambda configured="": "/usr/local/bin/gbrain"
+    )
     provider = provider_module.GBrainMemoryProvider()
     provider.initialize(
         "session-with-sensitive-id",
@@ -92,6 +100,14 @@ def test_sync_turn_is_disabled_for_non_primary_context(provider_module, monkeypa
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(provider_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        provider_module,
+        "_load_provider_config",
+        lambda hermes_home: {"auto_capture": True},
+    )
+    monkeypatch.setattr(
+        provider_module, "_find_binary", lambda configured="": "/usr/local/bin/gbrain"
+    )
     provider = provider_module.GBrainMemoryProvider()
     provider.initialize(
         "session",
@@ -113,6 +129,14 @@ def test_sync_turn_is_disabled_for_private_channel(provider_module, monkeypatch,
         return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
     monkeypatch.setattr(provider_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        provider_module,
+        "_load_provider_config",
+        lambda hermes_home: {"auto_capture": True},
+    )
+    monkeypatch.setattr(
+        provider_module, "_find_binary", lambda configured="": "/usr/local/bin/gbrain"
+    )
     provider = provider_module.GBrainMemoryProvider()
     provider.initialize(
         "session",
@@ -136,6 +160,14 @@ def test_capture_turn_preserves_historical_timestamp_and_tool_names(
         return SimpleNamespace(returncode=0, stdout=b'{"status":"inserted"}', stderr=b"")
 
     monkeypatch.setattr(provider_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        provider_module,
+        "_load_provider_config",
+        lambda hermes_home: {"auto_capture": True},
+    )
+    monkeypatch.setattr(
+        provider_module, "_find_binary", lambda configured="": "/usr/local/bin/gbrain"
+    )
     provider = provider_module.GBrainMemoryProvider()
     provider.initialize(
         "historical-session",
@@ -157,3 +189,39 @@ def test_capture_turn_preserves_historical_timestamp_and_tool_names(
     body = calls[0][1]["input"].decode("utf-8")
     assert "- event_at: 2025-01-01T00:00:00Z" in body
     assert "recall" in body
+
+
+def test_person_policy_is_static_when_automatic_capture_is_disabled(
+    provider_module, monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        provider_module,
+        "_load_provider_config",
+        lambda hermes_home: {"auto_capture": False},
+    )
+    monkeypatch.setattr(
+        provider_module, "_find_binary", lambda configured="": "/usr/local/bin/gbrain"
+    )
+    provider = provider_module.GBrainMemoryProvider()
+    before_initialize = provider.system_prompt_block()
+
+    provider.initialize(
+        "session",
+        hermes_home=str(tmp_path),
+        platform="discord",
+        chat_name="accounting",
+        agent_context="subagent",
+    )
+
+    assert provider._active is False
+    assert provider.system_prompt_block() == before_initialize
+    assert "compiled read models" in before_initialize
+    assert "Never extract Facts back from a Person summary" in before_initialize
+    assert "never override the active brain/source scope" in before_initialize
+    assert provider.get_tool_schemas() == []
+
+    from agent.memory_manager import MemoryManager
+
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    assert manager.build_system_prompt() == before_initialize
