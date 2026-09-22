@@ -225,3 +225,52 @@ async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
     # First emit_collect fires on the original command; after rewrite the
     # dispatcher does NOT re-fire for the new command (one decision per turn).
     assert call_log == ["command:status"]
+
+
+@pytest.mark.asyncio
+async def test_plugin_command_receives_command_context(monkeypatch):
+    """A plugin handler declaring ``command_context`` gets the native envelope
+    built from the inbound event+source. Legacy ``fn(args)`` handlers stay
+    positional (covered by the rewrite test above)."""
+    import gateway.run as gateway_run
+    from hermes_cli import plugins as _plugins_mod
+
+    runner = _make_runner()
+    runner._run_agent = AsyncMock(
+        side_effect=AssertionError("plugin command leaked to the agent")
+    )
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    captured = {}
+
+    def _handler(raw_args, command_context=None):
+        captured["args"] = raw_args
+        captured["ctx"] = command_context
+        return "ctx ok"
+
+    monkeypatch.setattr(
+        _plugins_mod,
+        "get_plugin_command_handler",
+        lambda name: _handler if name == "ctxcmd" else None,
+    )
+
+    result = await runner._handle_message(_make_event("/ctxcmd hello"))
+
+    assert result == "ctx ok"
+    assert captured["args"] == "hello"
+    ctx = captured["ctx"]
+    assert ctx == {
+        "platform": "telegram",
+        "authorized": True,
+        "internal": False,
+        "is_bot": False,
+        "via_upstream_relay": False,
+        "native_input": True,
+        "user_id": "u1",
+        "chat_id": "c1",
+        "scope_id": None,
+        "profile": None,
+        "message_id": "m1",
+    }

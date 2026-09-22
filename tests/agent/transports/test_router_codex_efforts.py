@@ -8,10 +8,13 @@ router profile declares each model's vocabulary from its cached catalog via
 ``ProviderProfile.supported_reasoning_efforts``; these tests pin how the
 codex transport consumes that declaration.
 
-All tests seed the plugin's in-memory cache directly — no network.
+All tests run without network — most seed the plugin's in-memory cache directly;
+``TestDiskMirror`` exercises the on-disk catalog mirror instead.
 """
 
+import json
 import sys
+import time
 
 import pytest
 
@@ -233,3 +236,62 @@ class TestCatalogIngestValidation:
             ],
         )
         assert profile.fetch_models() == ["b", "a", "c"]
+
+
+class TestDiskMirror:
+    """The on-disk catalog mirror seeds the cold cache once per home.
+
+    Regression: a refactor once dropped the ``_DISK_TTL_SECONDS`` constant while
+    leaving two readers, so any readable mirror raised NameError — the clamp
+    silently returned None on that call and the stale-mirror refresh never ran.
+    """
+
+    def _write_mirror(self, ts):
+        from hermes_constants import get_hermes_home
+
+        path = get_hermes_home() / "cache" / "router_catalog.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"ts": ts, "efforts": {"grok-4.6": ["low", "high"]}}),
+            encoding="utf-8",
+        )
+        return path
+
+    def _cold(self, mod, monkeypatch):
+        monkeypatch.setattr(mod, "_efforts_cache", None)
+        monkeypatch.setattr(mod, "_disk_checked", False)
+
+    def test_fresh_mirror_seeds_cold_cache(self, monkeypatch):
+        profile, mod = _router_plugin_module()
+        self._cold(mod, monkeypatch)
+        self._write_mirror(time.time())
+        assert profile.supported_reasoning_efforts("grok-4.6") == ("low", "high")
+
+    def test_stale_mirror_is_served_and_kicks_warm(self, monkeypatch):
+        _, mod = _router_plugin_module()
+        self._cold(mod, monkeypatch)
+        warmed = []
+        monkeypatch.setattr(mod, "_warm_efforts_async", lambda: warmed.append(True))
+        self._write_mirror(time.time() - 2 * mod._DISK_TTL_SECONDS)
+        assert mod._efforts_cache_only() == {"grok-4.6": ["low", "high"]}
+        assert warmed == [True]
+
+    def test_fresh_mirror_does_not_warm(self, monkeypatch):
+        _, mod = _router_plugin_module()
+        self._cold(mod, monkeypatch)
+        warmed = []
+        monkeypatch.setattr(mod, "_warm_efforts_async", lambda: warmed.append(True))
+        self._write_mirror(time.time())
+        assert mod._efforts_cache_only() == {"grok-4.6": ["low", "high"]}
+        assert warmed == []
+
+    def test_unparseable_ts_is_stale_not_dropped(self, monkeypatch):
+        # A corrupt "ts" must age the mirror to the TTL (still served + warm
+        # kicked), not discard a valid efforts map.
+        _, mod = _router_plugin_module()
+        self._cold(mod, monkeypatch)
+        warmed = []
+        monkeypatch.setattr(mod, "_warm_efforts_async", lambda: warmed.append(True))
+        self._write_mirror("not-a-number")
+        assert mod._efforts_cache_only() == {"grok-4.6": ["low", "high"]}
+        assert warmed == [True]

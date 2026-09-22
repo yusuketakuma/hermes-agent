@@ -414,7 +414,10 @@ def _set_cwd(rid, params, key, value, session):
     if not os.path.isdir(cwd):
         return _err(rid, 4002, f"working directory does not exist: {raw}")
     _write_config_key("terminal.cwd", cwd)
-    os.environ["TERMINAL_CWD"] = cwd
+    # ``TERMINAL_CWD`` belongs to the launch process. Keep launch-profile updates live, but never
+    # publish an explicit or session-bound secondary profile's cwd into that process-wide carrier.
+    if Path(get_hermes_home()).resolve() == Path(_hermes_home).resolve():
+        os.environ["TERMINAL_CWD"] = cwd
     return _kv(rid, "terminal.cwd", cwd, cwd=cwd, branch=git_probe.branch(cwd))
 
 
