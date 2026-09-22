@@ -2044,6 +2044,28 @@ def resolve_plugin_command_result(result: Any) -> Any:
     return outcome.get("value")
 
 
+def invoke_plugin_command(handler: Callable, raw_args: str,
+                          command_context: Optional[Mapping] = None) -> Any:
+    """Call a plugin slash-command handler with its declared surface.
+
+    Handlers that declare a ``command_context`` parameter (or ``**kwargs``)
+    receive the host-supplied native context envelope — platform identity and
+    authorization signals built by the caller (the messaging gateway builds a
+    real envelope from the inbound event; local surfaces pass ``None``).
+    Legacy ``fn(raw_args)`` handlers are invoked positionally, untouched —
+    signature inspection keeps the contract additive.
+    """
+    try:
+        params = inspect.signature(handler).parameters
+    except (TypeError, ValueError):
+        return handler(raw_args)
+    if ("command_context" in params
+            or any(p.kind is inspect.Parameter.VAR_KEYWORD
+                   for p in params.values())):
+        return handler(raw_args, command_context=command_context)
+    return handler(raw_args)
+
+
 def get_plugin_commands() -> Dict[str, dict]:
     """Plugin commands dict (name -> {handler, description, plugin}) after idempotent discovery."""
     return _ensure_plugins_discovered()._plugin_commands

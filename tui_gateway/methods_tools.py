@@ -528,7 +528,11 @@ def _plugin_command_handler(name: str):
 
 
 def _run_plugin_command(handler, arg: str) -> str:
-    return str(_tools_mod("hermes_cli.plugins").resolve_plugin_command_result(handler(arg)) or "")
+    plugins = _tools_mod("hermes_cli.plugins")
+    # TUI/Desktop sessions carry no platform-native chat envelope — handlers
+    # that require one get None and fail closed.
+    return str(plugins.resolve_plugin_command_result(
+        plugins.invoke_plugin_command(handler, arg)) or "")
 
 
 @contextlib.contextmanager

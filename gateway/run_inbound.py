@@ -1055,16 +1055,48 @@ class GatewayInboundMixin:
         # underscored autocomplete form matches plugin commands registered with hyphens.
         if command:
             try:
-                from hermes_cli.plugins import get_plugin_command_handler
+                from hermes_cli.plugins import (
+                    get_plugin_command_handler, invoke_plugin_command)
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
-                    result = plugin_handler(event.get_command_args().strip())
+                    result = invoke_plugin_command(
+                        plugin_handler, event.get_command_args().strip(),
+                        command_context=self._hm_plugin_command_context(event, source))
                     if asyncio.iscoroutine(result):
                         result = await result
                     return True, str(result) if result else None, command
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
         return False, None, command
+
+    @staticmethod
+    def _hm_plugin_command_context(
+        event: "MessageEvent", source: SessionSource
+    ) -> Dict[str, Any]:
+        """Native context envelope for plugin slash-command handlers.
+
+        Only reached for events that already passed intake authorization, so
+        ``authorized`` is True by construction; ``internal`` still flags
+        synthetic events and ``via_upstream_relay`` carries the wire-invisible
+        relay trust bit — a plugin must not treat relay-fronted input as
+        directly authenticated.
+        """
+        platform = source.platform.value if source and source.platform else None
+        return {
+            "platform": platform,
+            "authorized": True,
+            "internal": bool(getattr(event, "internal", False)),
+            "is_bot": bool(source.is_bot) if source else False,
+            "via_upstream_relay": bool(
+                getattr(source, "delivered_via_upstream_relay", False))
+            if source else False,
+            "native_input": True,
+            "user_id": event.user_id or (source.user_id if source else None),
+            "chat_id": source.chat_id if source else None,
+            "scope_id": source.scope_id if source else None,
+            "profile": source.profile if source else None,
+            "message_id": event.message_id,
+        }
 
     def _hm_bundle_slash_rewrite(
         self, event: "MessageEvent", source: SessionSource, _quick_key: str, command: str
