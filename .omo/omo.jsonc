@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/code-yeongyu/oh-my-openagent/dev/assets/omo.schema.json",
+  "[opencode]": {
+    "default_run_agent": "Sisyphus",
+    "sisyphus_agent": {
+      "disabled": false
+    }
+  },
+  "_migrations": [
+    "2026-08-reasoning-unification"
+  ]
+}
