@@ -17,6 +17,7 @@ import os
 import re
 import time
 from contextlib import suppress
+from functools import partial
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
 from gateway.platforms.event import MessageEvent, MessageType
@@ -26,7 +27,8 @@ from gateway.run_inbound_unauthorized import (
     unauthorized_owner_hint,
 )
 from gateway.session import (
-    SessionSource, is_shared_multi_user_session, neutralize_untrusted_inline_text
+    SessionSource, build_session_context, is_shared_multi_user_session,
+    neutralize_untrusted_inline_text,
 )
 from gateway.turn_lease import TurnLeaseTimeoutError
 from typing import Any, Dict, List, Optional, Tuple
@@ -97,19 +99,19 @@ class GatewayInboundMixin:
         match = _BOT_CHAT_PROTOCOL_RE.search(str(getattr(event, "text", "") or ""))
         return match.group(1).upper() if match else None
 
-    def _hm_pre_gateway_dispatch_hook(
+    async def _hm_pre_gateway_dispatch_hook(
         self, event: "MessageEvent", source: SessionSource
     ) -> Optional["MessageEvent"]:
         """Run the ``pre_gateway_dispatch`` plugin hook; None = drop, else the (maybe rewritten) event.
         Results: ``{"action": "skip"}`` → drop; ``{"action": "rewrite", "text"}`` → replace ``event.text``;
         ``allow``/None → normal dispatch. Runs BEFORE auth so plugins can handle unauthorized senders."""
         try:
-            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-            _hook_results = list(_invoke_hook(
+            from hermes_cli.lifecycle import ainvoke_hook as _ainvoke_hook
+            _hook_results = await _ainvoke_hook(
                 "pre_gateway_dispatch", event=event, gateway=self,
                 # getattr: bare-runner tests build GatewayRunner via object.__new__ without __init__.
                 session_store=getattr(self, "session_store", None),
-            ) or [])
+            ) or []
         except Exception as _hook_exc:
             logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
             if self._hm_bot_conversation_candidate(event):
@@ -284,7 +286,7 @@ class GatewayInboundMixin:
         # scale-to-zero: only real user-originated inbound stamps the last-inbound clock;
         # counting internal/system events would keep a genuinely idle gateway awake.
         self._scale_to_zero_note_real_inbound()
-        event = self._hm_pre_gateway_dispatch_hook(event, source)
+        event = await self._hm_pre_gateway_dispatch_hook(event, source)
         if event is None:
             return None
         source = event.source
@@ -1076,7 +1078,8 @@ class GatewayInboundMixin:
             or self._gateway_idle_command_handlers().get(canonical)
         )
         if plain_handler is not None:
-            return True, await plain_handler(event)
+            async with self._async_profile_scope_for_source(source):
+                return True, await plain_handler(event)
         if canonical in self._HM_CANONICAL_COMMANDS:
             return await getattr(self, f"_hm_cmd_{canonical}")(event, source, _quick_key)
         return False, None
@@ -1141,11 +1144,26 @@ class GatewayInboundMixin:
                     get_plugin_command_handler, invoke_plugin_command)
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
-                    result = invoke_plugin_command(
-                        plugin_handler, event.get_command_args().strip(),
-                        command_context=self._hm_plugin_command_context(event, source))
-                    if asyncio.iscoroutine(result):
-                        result = await result
+                    # The agent-turn path binds HERMES_SESSION_* via _set_session_env; this dispatch
+                    # sits before it, so a handler reading get_session_env() would see an empty or a
+                    # foreign (cron agent's os.environ) session (#108698). No session_entry exists yet,
+                    # so session_key is derived from source. Sync handlers run on the gateway pool
+                    # (contextvars carried), never the loop thread: blocking I/O there starves the
+                    # liveness watchdog and the process exits 75 mid-handler (#105279).
+                    _plugin_context = build_session_context(source, self.config)
+                    _plugin_context.session_key = self._session_key_for_source(source)
+                    user_args = event.get_command_args().strip()
+                    invoke = partial(
+                        invoke_plugin_command, plugin_handler, user_args,
+                        command_context=self._hm_plugin_command_context(event, source),
+                    )
+                    with self._session_env_scope(_plugin_context):
+                        if asyncio.iscoroutinefunction(plugin_handler):
+                            result = await invoke()
+                        else:
+                            result = await self._run_in_executor_with_context(invoke)
+                        if asyncio.iscoroutine(result):
+                            result = await result
                     return True, str(result) if result else None, command
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
@@ -1475,8 +1493,9 @@ class GatewayInboundMixin:
             try:
                 self._restore_pending_one_turn_model_override(_quick_key, _run_generation)
                 # SIGKILL/OOM skips finally, leaving the durable marker for the next unclean startup's
-                # recovery pass.
-                await self._clear_durable_active_turn(event)
+                # recovery pass. Adapter delivery owns the marker until its reply is ledgered.
+                if not getattr(event, "_turn_marker_handoff", False):
+                    await self._clear_durable_active_turn(event)
             finally:
                 # Release only this turn's generation. Eviction may immediately admit a replacement
                 # through the cold path; an unconditional release here would then clear the replacement

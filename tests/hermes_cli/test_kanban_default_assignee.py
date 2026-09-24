@@ -7,36 +7,20 @@ the task is skipped (existing behavior preserved).
 from __future__ import annotations
 
 import json
-import os
-import sys
-import tempfile
+from pathlib import Path
 
 import pytest
 
 
 @pytest.fixture()
-def isolated_kanban_home(monkeypatch):
-    """Spin up a fresh HERMES_HOME with a clean kanban DB."""
-    test_home = tempfile.mkdtemp(prefix="kanban_default_assignee_test_")
-    monkeypatch.setenv("HERMES_HOME", test_home)
-    # Force-reimport so the fresh HERMES_HOME is picked up.
-    evicted = {}
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-            evicted[mod] = sys.modules.pop(mod)
+def isolated_kanban_home(tmp_path, monkeypatch):
+    """Fresh HERMES_HOME with a clean kanban DB."""
+    test_home = tmp_path / ".hermes"
+    test_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(test_home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
     from hermes_cli import kanban_db
-    try:
-        yield kanban_db, test_home
-    finally:
-        # Restore the original module objects — re-imported copies registered
-        # during this test must not replace the originals that collection-time
-        # imports in other test files still reference.
-        for mod in list(sys.modules.keys()):
-            if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
-                del sys.modules[mod]
-        sys.modules.update(evicted)
-        # tempfile dir survives; pytest isolation gives each test its own
-        # monkeypatched HERMES_HOME.
+    yield kanban_db, test_home
 
 
 def _fake_spawn(*args, **kwargs):

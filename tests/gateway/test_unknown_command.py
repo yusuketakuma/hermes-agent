@@ -274,3 +274,35 @@ async def test_plugin_command_receives_command_context(monkeypatch):
         "profile": None,
         "message_id": "m1",
     }
+
+
+@pytest.mark.asyncio
+async def test_sync_plugin_command_runs_off_loop_thread(monkeypatch):
+    """A synchronous plugin handler runs on the gateway worker, not the event loop."""
+    import threading
+
+    import gateway.run as gateway_run
+    from hermes_cli import plugins as _plugins_mod
+
+    runner = _make_runner()
+    seen_threads = []
+
+    def _blocking_handler(args: str) -> str:
+        seen_threads.append(threading.current_thread().name)
+        return f"sync {args}"
+
+    monkeypatch.setattr(
+        _plugins_mod,
+        "get_plugin_command_handler",
+        lambda name: _blocking_handler if name == "slow-api" else None,
+    )
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(_make_event("/slow-api arg"))
+
+    assert result == "sync arg"
+    assert seen_threads, "handler must have run"
+    # pytest-asyncio runs the loop on the main thread; the blocking handler must not.
+    assert seen_threads[0] != threading.main_thread().name

@@ -975,8 +975,46 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
-# Clean exits without a terminal tool call use the same finite failure budget
-# as crashes and timeouts; no separate retry counter can bypass the breaker.
+# ~96% of "clean exit without a terminal tool call" tasks complete on a later
+# run, so a protocol violation gets a bounded retry before the breaker trips.
+# The budget is a violation-only STREAK (``_protocol_violation_streak``),
+# independent of ``consecutive_failures``: other failure kinds neither consume
+# nor extend it. Per-task ``max_retries`` overrides it.
+_PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
+
+# Closed runs to walk when counting the streak; it trips at a handful anyway.
+_PROTOCOL_VIOLATION_SCAN_LIMIT = 50
+
+
+def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count the task's trailing run of clean-exit protocol violations.
+
+    Walks closed runs newest-first (including the one ``detect_crashed_workers``
+    just closed). ``rate_limited`` runs are neutral and skipped (a quota wall
+    says nothing about the task); any other closed run breaks the streak, so
+    the budget counts ONLY protocol violations. Violations are recognized by the
+    ``protocol_violation`` run-metadata marker, with the error text as fallback
+    for runs recorded before the marker existed.
+    """
+    streak = 0
+    rows = conn.execute(
+        "SELECT outcome, error, metadata FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
+    ).fetchall()
+    for row in rows:
+        outcome = row["outcome"] or ""
+        if outcome == "rate_limited":
+            continue
+        if outcome == "crashed" and (
+            _kb._json_dict(row["metadata"]).get("protocol_violation")
+            or "protocol violation" in (row["error"] or "")
+        ):
+            streak += 1
+            continue
+        break
+    return streak
 
 
 _PROTOCOL_VIOLATION_ERROR = (
@@ -2782,17 +2820,20 @@ def _worker_profile_scope(hermes_home: str, *, bind_home: bool = True):
 
     home = Path(hermes_home)
     is_launch_home = str(home.resolve()) == str(Path(get_process_hermes_home()).resolve())
-    home_token = set_hermes_home_override(str(home)) if bind_home else None
-    secret_token = set_secret_scope(
-        launch_secret_scope(home) if is_launch_home else build_profile_secret_scope(home))
-    terminal_token = install_profile_terminal_scope(
-        home, env_overlay=launch_terminal_env() if is_launch_home else None) if bind_home else None
+    home_token = secret_token = terminal_token = None
     try:
+        home_token = set_hermes_home_override(str(home)) if bind_home else None
+        secret_token = set_secret_scope(
+            launch_secret_scope(home) if is_launch_home else build_profile_secret_scope(home),
+            profile_home=None if is_launch_home else str(home))
+        terminal_token = install_profile_terminal_scope(
+            home, env_overlay=launch_terminal_env() if is_launch_home else None) if bind_home else None
         yield
     finally:
         if terminal_token is not None:
             reset_terminal_scope(terminal_token)
-        reset_secret_scope(secret_token)
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
         if home_token is not None:
             reset_hermes_home_override(home_token)
 

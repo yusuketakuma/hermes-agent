@@ -348,9 +348,14 @@ def _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_r
         1 for m in messages
         if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
     )
+    # Fork turns (background review, side questions) carry ``_turn_origin``; tagging the
+    # exit line keeps a fork's ``interrupted_during_api_call`` from reading as a killed
+    # foreground stream — the fork shares the parent's session_id and often its model (#118693).
+    _turn_origin = getattr(agent, "_turn_origin", None)
     _diag_msg = (
         "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
         "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
+        + (" origin=%s" if _turn_origin else "")
     )
     _diag_args = (
         _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
@@ -358,6 +363,7 @@ def _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_r
         agent.iteration_budget.max_total if agent.iteration_budget else 0,
         _turn_tool_count, _last_msg_role, len(final_response) if final_response else 0,
         agent.session_id or "none",
+        *((_turn_origin,) if _turn_origin else ()),
     )
     if _last_msg_role == "tool" and not interrupted:
         logger.warning(
@@ -601,24 +607,6 @@ def _last_turn_reasoning(messages) -> Optional[Any]:
     return None
 
 
-def _apply_output_transform(agent, final_response, logger, *, platform, turn_id) -> Tuple[Any, bool, Optional[Any]]:
-    """Apply the first ``transform_llm_output`` result before evidence gates and persistence."""
-    transformed, pre_transform = False, None
-    # First hook to return a string wins; None/empty leaves the text unchanged.
-    for _hook_result in _invoke_hook_safely(
-        "transform_llm_output", logger,
-        response_text=final_response,
-        session_id=agent.session_id or "",
-        model=agent.model,
-        platform=platform,
-        turn_id=turn_id,  # per-turn identity for the hook callback gate
-    ):
-        if isinstance(_hook_result, str) and _hook_result:
-            pre_transform, final_response, transformed = final_response, _hook_result, True
-            break
-    return final_response, transformed, pre_transform
-
-
 def _notify_post_llm_call(
     agent, final_response, logger, *, platform, effective_task_id, turn_id,
     original_user_message, messages,
@@ -644,18 +632,60 @@ def _apply_output_hooks(
     messages,
 ) -> Tuple[Any, bool, Optional[Any]]:
     """Compatibility wrapper for callers that invoke both output hooks directly."""
-    final_response, transformed, pre_transform = _apply_output_transform(
-        agent, final_response, logger, platform=platform, turn_id=turn_id,
+    final_response, transformed, pre_transform = apply_llm_output_transform(
+        agent, final_response, turn_id=turn_id, platform=platform, logger=logger,
     )
+    _notify_post_llm_call(
+        agent, final_response, logger, platform=platform, effective_task_id=effective_task_id,
+        turn_id=turn_id, original_user_message=original_user_message, messages=messages,
+    )
+    return final_response, transformed, pre_transform
+
+
+def apply_llm_output_transform(
+    agent, final_response, *, turn_id, platform=None, logger=None,
+) -> Tuple[Any, bool, Optional[Any]]:
+    """Fire ``transform_llm_output`` once per turn and return
+    ``(final_response, transformed, pre_transform_response)``.
+
+    Called BEFORE the final assistant row is first persisted — from ``finish_text_response``
+    ahead of its durable flush, and from ``finalize_turn._persist_step`` ahead of the
+    recovery-path tail close — so the text the user sees is the text stored in SQLite/JSON and
+    replayed next turn (#44239). SQLite treats a non-blank assistant row as settled (a re-flush
+    adopts the stored content rather than overwriting it), so transforming after that first
+    write can never reach the durable store. Idempotent per ``turn_id``: later callers in the
+    same turn get the recorded outcome instead of a second hook firing. Only the current
+    turn's not-yet-written text is touched — earlier turns and the system prompt are never
+    rewritten (prompt-cache invariant)."""
+    if logger is None:
+        from agent.conversation_loop import logger
+    recorded = getattr(agent, "_llm_output_transform", None)
+    if isinstance(recorded, tuple) and len(recorded) == 3 and recorded[0] == turn_id:
+        _, transformed, pre_transform = recorded
+        return final_response, transformed, pre_transform
+    if not final_response:
+        return final_response, False, None
+    if platform is None:
+        platform = getattr(agent, "platform", None) or ""
+    transformed, pre_transform = False, None
+    # First hook to return a string wins; None/empty leaves the text unchanged.
+    for _hook_result in _invoke_hook_safely(
+        "transform_llm_output", logger,
+        response_text=final_response,
+        session_id=agent.session_id or "",
+        model=agent.model,
+        platform=platform,
+        turn_id=turn_id,  # per-turn identity for the hook callback gate
+    ):
+        if isinstance(_hook_result, str) and _hook_result:
+            pre_transform, final_response, transformed = final_response, _hook_result, True
+            break
     before_gate = final_response
     final_response, gate_changed = _apply_bot_chat_delivery_gate(agent, final_response, logger)
     if gate_changed:
         pre_transform = pre_transform or before_gate
         transformed = True
-    _notify_post_llm_call(
-        agent, final_response, logger, platform=platform, effective_task_id=effective_task_id,
-        turn_id=turn_id, original_user_message=original_user_message, messages=messages,
-    )
+    agent._llm_output_transform = (turn_id, transformed, pre_transform)
     return final_response, transformed, pre_transform
 
 
@@ -721,15 +751,15 @@ def finalize_turn(
     _transcript_response = final_response
     if final_response and not interrupted:
         final_response = _append_file_mutation_footer(agent, final_response, logger)
-    if not interrupted:
+    if not interrupted and _turn_exit_reason != "partial_stream_recovery":
         final_response = _explain_abnormal_exit(
             agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
         )
     if final_response and not interrupted:
-        final_response, _response_transformed, _pre_transform_response = _apply_output_transform(
-            agent, final_response, logger, platform=_platform, turn_id=turn_id,
+        final_response, _response_transformed, _pre_transform_response = apply_llm_output_transform(
+            agent, final_response, turn_id=turn_id, platform=_platform, logger=logger,
         )
-    if final_response:
+    elif final_response:
         _before_gate = final_response
         final_response, _gate_changed = _apply_bot_chat_delivery_gate(agent, final_response, logger)
         if _gate_changed:
@@ -760,6 +790,12 @@ def finalize_turn(
     with suppress(Exception):
         agent._session_messages = messages
 
+    if not interrupted and _turn_exit_reason == "partial_stream_recovery":
+        # The recovery row stores the transformed text; the completion explanation
+        # describes the interrupted stream to this delivery, not the model's reply.
+        final_response = _explain_abnormal_exit(
+            agent, final_response, _turn_exit_reason, preserved_verification_fallback, logger,
+        )
     _log_turn_exit(agent, messages, final_response, api_call_count, _turn_exit_reason, interrupted, logger)
 
     if final_response and not interrupted:

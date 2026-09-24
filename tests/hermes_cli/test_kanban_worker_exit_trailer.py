@@ -50,12 +50,12 @@ def _dead_worker_with_log(conn, tid: str, pid: int, rc: int) -> None:
 
 @pytest.mark.parametrize(
     "rc, event, failure_counted",
-    [(0, "protocol_violation", False), (kb.KANBAN_RATE_LIMIT_EXIT_CODE, "rate_limited", False)],
+    [(0, "protocol_violation", False), (kb.KANBAN_RATE_LIMIT_EXIT_CODE, "rate_limited", True)],
 )
 def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, event, failure_counted):
     """Empty reap registry + exit trailer in the log: a clean exit is the protocol violation
-    (marker, streak, no unified-budget hit) and a 75 is a rate-limit requeue — not a bare
-    ``pid N not alive`` crash that counts a failure."""
+    (marker, streak, no unified-budget hit) and a 75 is a rate-limit requeue
+    counted against the failure budget — neither is a bare ``pid N not alive`` crash."""
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="t", assignee="a")
         _dead_worker_with_log(conn, tid, 70001, rc)
@@ -127,7 +127,7 @@ def test_plain_budget_trip_still_auto_recovers(kanban_home):
                 release_claim=False, end_run=False,
             )
         assert kb.get_task(conn, tids[1]).status == "blocked"
-        kb.assign_task(conn, tids[1], "other-profile")
+        kb.assign_task(conn, tids[1], "other-profile", allow_scope_rebind=True)
         assert kb.recompute_ready(conn, failure_limit=2) == 1
         assert kb.get_task(conn, tids[1]).status == "ready"
 
