@@ -1293,6 +1293,16 @@ After registration, users can type `/mystatus` in any session. The command appea
 | `handler` | `Callable[[str], str \| None]` | Called with the raw argument string. May also be `async`. |
 | `description` | `str` | Shown in `/help`, autocomplete, and Telegram bot menu |
 
+Gateway handlers may also declare an optional `command_context=None` parameter.
+The context includes platform, user/chat identity, authorization, and provenance.
+`native_input` is true only when the receiving adapter attests that the command
+is unchanged live user input. Discord attests native slash interactions and direct
+typed commands; forwarded snapshots, attachments, recovered messages, internal
+events, and subsequent rewrites do not qualify. Other adapters and restored or
+manually constructed events default to false. Plugins requiring human consent
+must require this flag and also enforce their own scope and bot/relay policy.
+Handlers accepting only the argument string continue to work unchanged.
+
 **Key differences from `register_cli_command()`:**
 
 | | `register_command()` | `register_cli_command()` |

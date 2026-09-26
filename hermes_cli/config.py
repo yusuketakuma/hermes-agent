@@ -35,6 +35,7 @@ import yaml
 
 from hermes_cli.cli_output import line_input
 from hermes_cli.colors import Colors, color
+from hermes_cli.config_set import set_config_command
 from hermes_cli import managed_scope
 from hermes_cli.default_soul import DEFAULT_SOUL_MD, is_legacy_template_soul
 from hermes_cli.secret_prompt import masked_secret_prompt
@@ -3727,7 +3728,7 @@ def _run_write_command(fn, *args) -> None:
 _USAGE_GET = ("Usage: hermes config get <key> [--json] [--raw]", [
     "hermes config get model", "hermes config get terminal.backend",
     "hermes config get skills.config --json"], None)
-_USAGE_SET = ("Usage: hermes config set [--force] <key> <value>", [
+_USAGE_SET = ("Usage: hermes config set [--force] <key> (<value> | --stdin)", [
     "hermes config set model anthropic/claude-sonnet-4", "hermes config set terminal.backend docker",
     "hermes config set OPENROUTER_API_KEY sk-or-..."], [
     "", "  --force: skip the unknown-key notice for unrecognized keys,",
@@ -3742,14 +3743,6 @@ def _cmd_config_get(args):
     if not key:
         _usage_exit(*_USAGE_GET)
     get_config_value(key, as_json=getattr(args, 'json', False), raw=bool(getattr(args, 'raw', False)))
-
-
-def _cmd_config_set(args):
-    key = getattr(args, 'key', None)
-    value = getattr(args, 'value', None)
-    if not key or value is None:
-        _usage_exit(*_USAGE_SET)
-    _run_write_command(set_config_value, key, value, bool(getattr(args, 'force', False)))
 
 
 def _cmd_config_unset(args):
@@ -3844,7 +3837,7 @@ _CONFIG_SUBCOMMANDS = {
     "show": lambda args: show_config(),
     "edit": lambda args: edit_config(),
     "get": _cmd_config_get,
-    "set": _cmd_config_set,
+    "set": set_config_command,
     "unset": _cmd_config_unset,
     "path": lambda args: print(get_config_path()),
     "env-path": lambda args: print(get_env_path()),

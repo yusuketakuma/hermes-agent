@@ -4725,10 +4725,13 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         )
         msg_type = MessageType.COMMAND if text.startswith("/") else MessageType.TEXT
         channel_id = str(interaction.channel_id)
-        return MessageEvent(
+        event = MessageEvent(
             text=text, message_type=msg_type, source=source, raw_message=interaction,
             channel_prompt=self._resolve_channel_prompt(channel_id, parent_id or None),
         )
+        if msg_type == MessageType.COMMAND:
+            event._native_command_text = text
+        return event
 
     # --- Thread creation helpers ---
 
@@ -6314,6 +6317,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             timestamp=message.created_at, auto_skill=_skills, channel_prompt=_channel_prompt,
             channel_context=_channel_context,
         )
+        if (msg_type == MessageType.COMMAND and not recovered
+                and not getattr(message, "message_snapshots", None)
+                and not all_attachments and event_text == normalized_content):
+            event._native_command_text = event_text
         if (
             getattr(getattr(message, "author", None), "bot", False)
             and self._is_bot_tag_debounce_continuation(message)

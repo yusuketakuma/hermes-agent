@@ -29,6 +29,10 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
         "key", nargs="?", help="Configuration key (e.g., model, terminal.backend)")
     config_set.add_argument("value", nargs="?", help="Value to set")
     config_set.add_argument(
+        "--stdin", action="store_true",
+        help="Read the value from piped stdin instead of an argument; "
+        "removes one final newline and refuses empty input.")
+    config_set.add_argument(
         "--force", action="store_true",
         help="Write a key the running version doesn't recognize: an unknown path under a known "
         "section is otherwise refused, and an unknown top-level key is written with a notice.")

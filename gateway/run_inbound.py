@@ -1190,7 +1190,7 @@ class GatewayInboundMixin:
             "via_upstream_relay": bool(
                 getattr(source, "delivered_via_upstream_relay", False))
             if source else False,
-            "native_input": True,
+            "native_input": event.has_native_command_input(),
             "user_id": event.user_id or (source.user_id if source else None),
             "chat_id": source.chat_id if source else None,
             "scope_id": source.scope_id if source else None,

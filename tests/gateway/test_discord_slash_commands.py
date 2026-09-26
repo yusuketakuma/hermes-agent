@@ -398,6 +398,34 @@ def test_build_slash_event_preserves_thread_context(adapter):
     assert "TestGuild" in event.source.chat_name
 
 
+def test_native_command_provenance_expires_when_input_is_changed(adapter):
+    from gateway.platforms.event import MessageEvent
+    from gateway.run_inbound import GatewayInboundMixin
+
+    interaction = SimpleNamespace(
+        channel=_FakeThreadChannel(channel_id=555, name="Planning"),
+        channel_id=555, user=SimpleNamespace(display_name="Jezza", id=42))
+    event = adapter._build_slash_event(interaction, "/consent original")
+
+    def native(candidate):
+        return GatewayInboundMixin._hm_plugin_command_context(
+            candidate, candidate.source)["native_input"]
+
+    assert native(event)
+    event.text = "/consent substituted"
+    assert not native(event)
+    event.text = "/consent original"
+    event.internal = True
+    assert not native(event)
+    event.internal = False
+    event.allow_gateway_control = False
+    assert not native(event)
+    restored = MessageEvent(text="/consent original", source=event.source,
+                            metadata={"native_input": True,
+                                      "_native_command_text": "/consent original"})
+    assert not native(restored)
+
+
 # ------------------------------------------------------------------
 # Auto-thread: _auto_create_thread
 # ------------------------------------------------------------------

@@ -267,7 +267,7 @@ async def test_plugin_command_receives_command_context(monkeypatch):
         "internal": False,
         "is_bot": False,
         "via_upstream_relay": False,
-        "native_input": True,
+        "native_input": False,
         "user_id": "u1",
         "chat_id": "c1",
         "scope_id": None,

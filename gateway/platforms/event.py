@@ -93,6 +93,18 @@ class MessageEvent:
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
+    # Live transport attestation, never accepted from metadata or restored events. A rewrite
+    # or coalescing changes text and invalidates it before a plugin can treat it as consent.
+    _native_command_text: Optional[str] = field(default=None, init=False, repr=False, compare=False)
+
+    def has_native_command_input(self) -> bool:
+        """Whether the transport attested this unchanged, live user command."""
+        return (
+            self._native_command_text is not None
+            and self._native_command_text == self.text
+            and self.allow_gateway_control
+            and not self.internal
+        )
 
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
