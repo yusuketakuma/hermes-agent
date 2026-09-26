@@ -802,7 +802,7 @@ class GatewayBusySessionMixin:
         # Busy callbacks enter directly from adapters and do not pass through _hm_admit_event.
         # Classify the event here before steer/redirect/queue can select the wrong model.
         if not getattr(event, "_gateway_dispatch_classified", False):
-            event = self._hm_pre_gateway_dispatch_hook(event, event.source)
+            event = await self._hm_pre_gateway_dispatch_hook(event, event.source)
             if event is None:
                 return True
 

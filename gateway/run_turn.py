@@ -2864,9 +2864,6 @@ class GatewayTurnMixin:
         stream_task = asyncio.create_task(_stream_consumer.run()) if _stream_consumer else None
 
         _adapter = self._delivery_adapter_for(source)
-        if _adapter and not scheduled_heartbeat:
-            with suppress(Exception):
-                await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
 
         full_response = ""
         _start = time.time()
@@ -3763,7 +3760,7 @@ class GatewayTurnMixin:
                 and not getattr(pending_event, "internal", False)
                 and not getattr(pending_event, "_gateway_dispatch_classified", False)
             ):
-                pending_event = self._hm_pre_gateway_dispatch_hook(
+                pending_event = await self._hm_pre_gateway_dispatch_hook(
                     pending_event, getattr(pending_event, "source", source) or source,
                 )
                 pending_event_route_rejected = pending_event is None

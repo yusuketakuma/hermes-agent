@@ -110,20 +110,40 @@ def _load_bot_conversation_plugin():
 class TestBusySessionAck:
     """User sends a message while agent is running — should get acknowledgment."""
 
+    @pytest.mark.asyncio
+    async def test_pending_followup_awaits_route_classification(self, monkeypatch):
+        runner, _sentinel = _make_runner()
+        event = _make_event(text="queued follow-up")
+        adapter = _make_adapter()
+        monkeypatch.setattr("gateway.run._dequeue_pending_event", lambda *_args: event)
+        runner._promote_queued_event = lambda _key, _adapter, pending: pending
+        runner._hm_pre_gateway_dispatch_hook = AsyncMock(return_value=event)
+        runner._pending_event_audio_paths = lambda _event: []
 
-    def test_pre_dispatch_skip_has_priority_over_allow(self, monkeypatch):
+        pending_event, pending = await runner._run_agent_drain_pending(
+            {"interrupted": False}, adapter, event.source, "session",
+        )
+
+        assert pending_event is event
+        assert pending == "queued follow-up"
+        runner._hm_pre_gateway_dispatch_hook.assert_awaited_once_with(event, event.source)
+
+
+    @pytest.mark.asyncio
+    async def test_pre_dispatch_skip_has_priority_over_allow(self, monkeypatch):
         runner, _sentinel = _make_runner()
         event = _make_event()
 
         monkeypatch.setattr(
-            "hermes_cli.lifecycle.invoke_hook",
-            lambda *_args, **_kwargs: [{"action": "allow"}, {"action": "skip", "reason": "blocked"}],
+            "hermes_cli.lifecycle.ainvoke_hook",
+            AsyncMock(return_value=[{"action": "allow"}, {"action": "skip", "reason": "blocked"}]),
         )
 
-        assert runner._hm_pre_gateway_dispatch_hook(event, event.source) is None
+        assert await runner._hm_pre_gateway_dispatch_hook(event, event.source) is None
 
 
-    def test_bot_chat_hook_failure_fails_closed(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_bot_chat_hook_failure_fails_closed(self, monkeypatch):
         runner, _sentinel = _make_runner()
         event = _make_event(text="種別=CHAT\n要約=hello", chat_id="1548242914268807228", platform_val="discord")
         event.source.is_bot = True
@@ -131,18 +151,19 @@ class TestBusySessionAck:
         def fail(*_args, **_kwargs):
             raise RuntimeError("hook unavailable")
 
-        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", fail)
+        monkeypatch.setattr("hermes_cli.lifecycle.ainvoke_hook", AsyncMock(side_effect=fail))
 
-        assert runner._hm_pre_gateway_dispatch_hook(event, event.source) is None
+        assert await runner._hm_pre_gateway_dispatch_hook(event, event.source) is None
 
 
-    def test_unregistered_bot_chat_route_fails_closed(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_unregistered_bot_chat_route_fails_closed(self, monkeypatch):
         runner, _sentinel = _make_runner()
         event = _make_event(text="種別=CHAT\n要約=hello", chat_id="1548242914268807228", platform_val="discord")
         event.source.is_bot = True
-        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr("hermes_cli.lifecycle.ainvoke_hook", AsyncMock(return_value=[]))
 
-        assert runner._hm_pre_gateway_dispatch_hook(event, event.source) is None
+        assert await runner._hm_pre_gateway_dispatch_hook(event, event.source) is None
 
 
     @pytest.mark.parametrize(
@@ -154,7 +175,8 @@ class TestBusySessionAck:
             ("CHAT", "🧭 種別=CHAT\n種別=TASK_PROPOSAL\n要約=rewritten"),
         ],
     )
-    def test_routing_relevant_rewrite_is_rejected(self, monkeypatch, before, after_text):
+    @pytest.mark.asyncio
+    async def test_routing_relevant_rewrite_is_rejected(self, monkeypatch, before, after_text):
         runner, _sentinel = _make_runner()
         event = _make_event(
             text=f"種別={before}\n要約=hello", chat_id="1548242914268807228", platform_val="discord",
@@ -165,14 +187,14 @@ class TestBusySessionAck:
             plugin, "_config", lambda: {"channel_id": "1548242914268807228"}
         )
         monkeypatch.setattr(
-            "hermes_cli.lifecycle.invoke_hook",
-            lambda name, **kwargs: [
+            "hermes_cli.lifecycle.ainvoke_hook",
+            AsyncMock(side_effect=lambda name, **kwargs: [
                 plugin._on_pre_gateway_dispatch(**kwargs),
                 {"action": "rewrite", "text": after_text},
-            ] if name == "pre_gateway_dispatch" else [],
+            ] if name == "pre_gateway_dispatch" else []),
         )
 
-        assert runner._hm_pre_gateway_dispatch_hook(event, event.source) is None
+        assert await runner._hm_pre_gateway_dispatch_hook(event, event.source) is None
         assert event.metadata["_bot_conversation_route_checked"] is True
 
 
@@ -441,7 +463,7 @@ class TestBusySessionAck:
         adapter = _make_adapter()
         source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
         sk = build_session_key(source)
-        runner._adapter_for_source = lambda _source: adapter
+        runner._delivery_adapter_for = lambda _source: adapter
         adapter.has_pending_interrupt = MagicMock(return_value=True)
         runner._run_agent_fire_pending_interrupt = AsyncMock(side_effect=[False, True])
         sleep_calls = []
@@ -516,7 +538,7 @@ class TestBusySessionAck:
         runner._run_agent_stream_consumer_task = noop
         runner._run_agent_track_agent = noop
         runner._run_agent_notify_long_running = noop
-        runner._adapter_for_source = lambda _source: None
+        runner._delivery_adapter_for = lambda _source: None
         runner._refresh_agent_cache_message_count = noop
         runner._run_agent = child_run
 
@@ -584,7 +606,7 @@ class TestBusySessionAck:
         runner._run_agent_stream_consumer_task = noop
         runner._run_agent_track_agent = noop
         runner._run_agent_notify_long_running = noop
-        runner._adapter_for_source = lambda _source: None
+        runner._delivery_adapter_for = lambda _source: None
         runner._refresh_agent_cache_message_count = noop
         runner._run_agent = child_run
 
@@ -655,7 +677,7 @@ class TestBusySessionAck:
         runner._run_agent_finalize_streaming_tts = noop
         runner._run_agent_drain_pending = AsyncMock(return_value=(None, "queued"))
         runner._run_agent_evict_on_fallback = lambda _ctx: None
-        runner._adapter_for_source = lambda _source: None
+        runner._delivery_adapter_for = lambda _source: None
         runner._refresh_agent_cache_message_count = noop
         runner._run_agent = child_run
         runner._release_running_agent_state = MagicMock()
@@ -749,7 +771,7 @@ class TestBusySessionAck:
             await asyncio.Event().wait()
 
         runner._proxy_stream_consumer = lambda *_args: consumer
-        runner._adapter_for_source = lambda _source: SimpleNamespace(send_typing=send_typing)
+        runner._delivery_adapter_for = lambda _source: SimpleNamespace(send_typing=send_typing)
         runner._thread_metadata_for_source = lambda *_args: None
         runner._run_still_current_fn = lambda *_args: lambda: True
         parent = asyncio.current_task()
