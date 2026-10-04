@@ -1,7 +1,16 @@
 ---
+type: concept
+title: Environment Variables
 sidebar_position: 2
-title: "Environment Variables"
-description: "Complete reference of all environment variables used by Hermes Agent"
+description: Complete reference of all environment variables used by Hermes Agent
+content_flag:
+  reason: markup_heavy
+  detail: >-
+    PAGE_OVERSIZE_WARN: body 95112 bytes exceeds 50000 byte warn threshold;
+    PAGE_MARKUP_HEAVY: markup ratio 0.89 exceeds 0.85 (flag, not hide)
+  assessed_at: '2026-10-01T11:55:18.138Z'
+  markup_ratio: 0.8920501490821569
+  bytes: 95112
 ---
 
 # Environment Variables Reference

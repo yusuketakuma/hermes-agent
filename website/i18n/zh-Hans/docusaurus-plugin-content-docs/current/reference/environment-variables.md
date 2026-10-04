@@ -1,7 +1,16 @@
 ---
+type: concept
+title: 环境变量
 sidebar_position: 2
-title: "环境变量"
-description: "Hermes Agent 使用的所有环境变量完整参考"
+description: Hermes Agent 使用的所有环境变量完整参考
+content_flag:
+  reason: markup_heavy
+  detail: >-
+    PAGE_OVERSIZE_WARN: body 63950 bytes exceeds 50000 byte warn threshold;
+    PAGE_MARKUP_HEAVY: markup ratio 0.92 exceeds 0.85 (flag, not hide)
+  assessed_at: '2026-10-01T11:55:53.058Z'
+  markup_ratio: 0.9185746925283166
+  bytes: 63950
 ---
 
 # 环境变量参考

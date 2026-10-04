@@ -1,3 +1,17 @@
+---
+type: concept
+title: Unsloth Docs
+content_flag:
+  reason: oversized
+  detail: 'PAGE_OVERSIZED: body 1077222 bytes exceeds 500000 byte block threshold'
+  assessed_at: '2026-10-01T11:44:02.365Z'
+  bytes: 1077222
+embed_skip:
+  reason: oversized
+  bytes: 1077222
+  assessed_at: '2026-10-01T11:44:02.365Z'
+---
+
 # Unsloth Docs
 
 Train your own model with Unsloth, an open-source framework for LLM fine-tuning and reinforcement learning.
@@ -16795,5 +16809,3 @@ We tested Llama 3.3 (70B) Instruct on a 80GB A100 and did 4bit QLoRA on all line
 | -------- | ------------------------ | ------------------ |
 | 48 GB    | 12,106                   | OOM                |
 | 80 GB    | 89,389                   | 6,916              |
-
-
