@@ -2,6 +2,7 @@ import sys
 
 import pytest
 
+from tests._fixtures.holder_scan import scan_only_own_process_tree
 
 def test_sessions_delete_accepts_unique_id_prefix(monkeypatch, capsys):
     import hermes_cli.main as main_mod
@@ -41,7 +42,6 @@ def test_sessions_delete_accepts_unique_id_prefix(monkeypatch, capsys):
     }
     assert "Deleted session '20260315_092437_c9a6ff'." in output
 
-
 def _run_prune(monkeypatch, capsys, argv_tail, candidates=None, skipped_open=0):
     """Run `hermes sessions prune <argv_tail>` against a FakeDB, capturing
     the filter kwargs passed to list_prune_candidates. Auto-confirms."""
@@ -78,11 +78,13 @@ def _run_prune(monkeypatch, capsys, argv_tail, candidates=None, skipped_open=0):
             return rows
 
         def count_open_prune_matches(self, **kwargs):
-            assert kwargs == seen
+            # Same filters as the preview. `whole_lineages` is the preview's selection mode, not a
+            # filter: an open row is never a compression ancestor, so the count never takes it.
+            assert kwargs == {k: v for k, v in seen.items() if k != "whole_lineages"}
             return skipped_open
 
-        def count_prune_matches(self, **kwargs):
-            return len(rows)
+        def count_prune_matches(self, pinned_only=False, **kwargs):
+            return 0 if pinned_only else len(rows)
 
         def prune_sessions(self, **kwargs):
             return len(rows)
@@ -91,13 +93,14 @@ def _run_prune(monkeypatch, capsys, argv_tail, candidates=None, skipped_open=0):
             pass
 
     monkeypatch.setattr(hermes_state, "SessionDB", lambda *args, **kwargs: FakeDB())
+    # prune's held-store gate scans for holders; the live host's processes would read as unknown.
+    scan_only_own_process_tree(monkeypatch)
     monkeypatch.setattr(
         sys, "argv", ["hermes", "sessions", "prune", *argv_tail]
     )
     monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
     main_mod.main()
     return seen, capsys.readouterr().out
-
 
 def test_sessions_prune_bare_keeps_90_day_default(monkeypatch, capsys):
     """A truly bare `hermes sessions prune` keeps the implicit 90-day cutoff."""
@@ -108,7 +111,3 @@ def test_sessions_prune_bare_keeps_90_day_default(monkeypatch, capsys):
     assert filters["last_active_before"] == pytest.approx(
         _time.time() - 90 * 86400, abs=60
     )
-
-
-
-

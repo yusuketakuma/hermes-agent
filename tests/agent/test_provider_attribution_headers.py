@@ -6,6 +6,7 @@ referrerUrl / appName / User-Agent flow into gateway analytics.
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from hermes_cli.version_info import get_version_info
 from run_agent import AIAgent
 
 
@@ -26,7 +27,7 @@ def test_ai_gateway_base_url_applies_attribution_headers(mock_openai):
     headers = agent._client_kwargs["default_headers"]
     assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
     assert headers["X-Title"] == "Hermes Agent"
-    assert headers["User-Agent"].startswith("HermesAgent/")
+    assert headers["User-Agent"] == f"HermesAgent/{get_version_info().base_version}"
 
 
 @patch("agent.process_bootstrap.OpenAI")
@@ -71,7 +72,7 @@ def test_opencode_go_applies_attribution_via_profile_fallback(mock_openai):
     headers = agent._client_kwargs["default_headers"]
     assert headers["HTTP-Referer"] == "https://hermes-agent.nousresearch.com"
     assert headers["X-Title"] == "Hermes Agent"
-    assert headers["User-Agent"].startswith("HermesAgent/")
+    assert headers["User-Agent"] == f"HermesAgent/{get_version_info().base_version}"
 
 
 @patch("agent.process_bootstrap.OpenAI")
@@ -130,8 +131,11 @@ def test_openrouter_headers_include_response_cache_when_enabled(mock_openai):
 # ---------------------------------------------------------------------------
 
 
+# Hermetic: never probe whatever really listens on localhost:8080 (e.g. a dev llama-server).
+@patch("agent.agent_init.query_ollama_num_ctx", return_value=None)
+@patch("agent.context_compressor.get_model_context_length", return_value=128_000)
 @patch("agent.process_bootstrap.OpenAI")
-def test_user_default_headers_override_sdk_user_agent(mock_openai):
+def test_user_default_headers_override_sdk_user_agent(mock_openai, _ctx, _num_ctx):
     """``model.default_headers`` lets a custom endpoint swap the OpenAI SDK
     User-Agent that some gateways/WAFs reject (the #40033 reproduction)."""
     mock_openai.return_value = MagicMock()

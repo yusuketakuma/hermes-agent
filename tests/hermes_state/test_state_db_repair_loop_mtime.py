@@ -28,9 +28,26 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 import hermes_state
 import hermes_state_repair
 from hermes_state_repair import _MAX_MALFORMED_BACKUPS, _MAX_PERSISTENT_REPAIR_ATTEMPTS, _REPAIR_BACKUP_MIN_FREE_BYTES, _backup_content_identity, _backup_db_file, _db_fingerprint, _existing_malformed_backups, _persistent_repair_attempts_exhausted, _record_repair_outcome, _repair_backup_headroom_bytes
+
+from tests._fixtures.disk_space import report_ample_disk_space
+from tests._fixtures.holder_scan import scan_only_own_process_tree
+
+
+@pytest.fixture(autouse=True)
+def _scan_only_own_process_tree(monkeypatch):
+    # The live host's processes would otherwise turn the holder scan into an unknown holder.
+    scan_only_own_process_tree(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _report_ample_disk_space(monkeypatch):
+    # A nearly-full host volume would otherwise trip the repair/backup disk guards.
+    report_ample_disk_space(monkeypatch)
 
 
 def _damaged_db(tmp_path: Path, size: int = 200_000) -> Path:

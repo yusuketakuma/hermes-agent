@@ -57,6 +57,10 @@ def test_tool_call_validation_accepts_dict_arguments(monkeypatch):
         lambda name, args, task_id=None, **kwargs: json.dumps({"ok": True, "args": args}),
     )
 
+    # Hermetic: never probe whatever really listens on localhost:8080 (e.g. a dev llama-server).
+    monkeypatch.setattr("agent.context_compressor.get_model_context_length", lambda *a, **k: 128_000)
+    monkeypatch.setattr("agent.agent_init.query_ollama_num_ctx", lambda *a, **k: None)
+
     agent = AIAgent(
         model="test-model",
         api_key="test-key",

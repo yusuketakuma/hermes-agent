@@ -35,7 +35,9 @@ def loop_thread():
 def test_warning_policy_at_real_transport_boundary(tmp_path, monkeypatch, loop_thread, lane, setting, for_failure):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(delivery_queue, "DELIVERY_DB", tmp_path / "delivery.db")
-    config_text = "cron: {wrap_response: false}\n"
+    # The Discord target allowlist (discord.server_targets) gates every cron Discord send.
+    allowlist = "discord: {server_targets: [{guild_id: g1, channel_ids: [fixture]}]}\n"
+    config_text = "cron: {wrap_response: false}\n" + allowlist
     if setting is not None:
         config_text += f"display: {{suppress_warning_notifications: {str(setting).lower()}}}\n"
     (tmp_path / "config.yaml").write_text(config_text)
@@ -86,7 +88,7 @@ def test_warning_policy_at_real_transport_boundary(tmp_path, monkeypatch, loop_t
     expected = "suppressed" if muted else "failed" if lane == "relay-failure" else "delivered"
     assert delivery_queue.get_status("run")["status"] == expected
     # Duplicate category and policy changes cannot overwrite durable SQL queue outcomes.
-    (tmp_path / "config.yaml").write_text("display: {suppress_warning_notifications: false}\n")
+    (tmp_path / "config.yaml").write_text("display: {suppress_warning_notifications: false}\n" + allowlist)
     delivery_queue.enqueue("run", job, payload, for_failure=not for_failure)
     assert scheduler.drain_delivery_queue(adapters, loop_thread) == 0
     assert delivery_queue.get_status("run")["status"] == expected

@@ -139,7 +139,7 @@ def test_surviving_descendant_is_quarantined_after_reopen(
 ):
     """A control-plane reopen must not release a live worker into a duplicate spawn."""
     parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
-    assert kb.complete_task(conn, parent_id)
+    assert kb.complete_task(conn, parent_id, result="done")
     child_id = kb.create_task(
         conn, title="running child", assignee="builder", parents=[parent_id],
     )

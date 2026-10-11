@@ -11,7 +11,16 @@ import sys
 
 import pytest
 
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="holder scan is unavailable on Windows")
+from tests._fixtures.holder_scan import scan_only_own_process_tree
+
+pytestmark = pytest.mark.platforms("posix")  # holder scan is unavailable on Windows
+
+
+@pytest.fixture(autouse=True)
+def _scan_only_own_process_tree(monkeypatch):
+    # The live host's processes would otherwise turn the holder scan into an unknown holder.
+    scan_only_own_process_tree(monkeypatch)
+
 
 _HOLDER = (
     "import sqlite3, sys\n"

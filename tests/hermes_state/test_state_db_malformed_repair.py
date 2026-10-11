@@ -28,6 +28,21 @@ import hermes_state_wal
 from hermes_state import SessionDB, is_malformed_db_error
 from hermes_state_repair import repair_state_db_schema
 
+from tests._fixtures.disk_space import report_ample_disk_space
+from tests._fixtures.holder_scan import scan_only_own_process_tree
+
+
+@pytest.fixture(autouse=True)
+def _scan_only_own_process_tree(monkeypatch):
+    # The live host's processes would otherwise turn the holder scan into an unknown holder.
+    scan_only_own_process_tree(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _report_ample_disk_space(monkeypatch):
+    # A nearly-full host volume would otherwise trip the repair/backup disk guards.
+    report_ample_disk_space(monkeypatch)
+
 
 def _build_healthy_db(db_path: Path) -> str:
     db = SessionDB(db_path=db_path)
@@ -461,7 +476,7 @@ def _lock_held_by_other_process(db_path: Path, hold_seconds: float = 30.0):
         proc.wait(timeout=10)
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock test")
+@pytest.mark.platforms("posix")  # POSIX flock test
 def test_repair_skips_surgery_while_another_process_holds_the_lock(
     tmp_path, monkeypatch
 ):
@@ -482,7 +497,7 @@ def test_repair_skips_surgery_while_another_process_holds_the_lock(
     assert hermes_state_repair._db_opens_cleanly(db_path) is not None
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock test")
+@pytest.mark.platforms("posix")  # POSIX flock test
 def test_repair_reports_success_when_the_holder_already_healed_the_db(
     tmp_path, monkeypatch
 ):
@@ -499,8 +514,10 @@ def test_repair_reports_success_when_the_holder_already_healed_the_db(
 
 
 _REPAIR_SCRIPT = """
-import sys, json
+import sys, json, shutil
 sys.path.insert(0, {root!r})
+from tests._fixtures.disk_space import ample_disk_usage
+shutil.disk_usage = ample_disk_usage  # the parent's autouse disk fake does not reach this child
 from hermes_state_repair import repair_state_db_schema
 print(json.dumps(repair_state_db_schema({db!r})), flush=True)
 """
@@ -517,7 +534,7 @@ def _release_header_probe_fds() -> None:
         hermes_state_dbfile._HEADER_PROBE_FDS.clear()
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock test")
+@pytest.mark.platforms("posix")  # POSIX flock test
 def test_two_processes_repairing_at_once_perform_surgery_once(tmp_path):
     """Concurrent repairers serialise; the loser sees a healed DB and stops.
 
@@ -672,7 +689,7 @@ def _mode_of(db_path) -> str:
 
 
 def _configure_journal_mode(monkeypatch, tmp_path, mode) -> None:
-    import yaml
+    import hermes_yaml as yaml
 
     home = tmp_path / "hermes-home"
     home.mkdir(exist_ok=True)

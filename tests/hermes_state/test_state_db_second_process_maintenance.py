@@ -14,6 +14,15 @@ import pytest
 from hermes_state import SessionDB
 from hermes_state_repair import repair_state_db_schema
 
+from tests._fixtures.holder_scan import scan_only_own_process_tree
+
+
+@pytest.fixture(autouse=True)
+def _scan_only_own_process_tree(monkeypatch):
+    # The live host's processes would otherwise turn the holder scan into an unknown holder.
+    scan_only_own_process_tree(monkeypatch)
+
+
 _HOLDER = """
 import sqlite3, sys
 conn = sqlite3.connect(sys.argv[1])
@@ -37,7 +46,7 @@ def delete_mode_db(tmp_path, monkeypatch) -> Path:
     return db
 
 
-@pytest.mark.linux_only
+@pytest.mark.platforms("linux")
 def test_repair_refuses_delete_mode_db_held_open_by_another_process(delete_mode_db):
     """A held DELETE-mode reader takes only SHARED, so ``BEGIN IMMEDIATE`` succeeds and the lock probe sees
     nothing; the holder scan must still refuse — REINDEX/VACUUM from a second process is the #103339 class."""

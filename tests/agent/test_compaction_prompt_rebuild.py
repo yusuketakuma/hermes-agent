@@ -233,7 +233,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
         from pathlib import Path
         from agent.system_prompt import build_system_prompt, invalidate_system_prompt
 
-        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-bind-"))
+        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-bind-")).resolve()  # git and getcwd report realpaths (macOS /var -> /private/var)
         old_cwd = os.getcwd()
         try:
             repo = _init_repo(tmp / "proj", "init commit")
@@ -252,6 +252,36 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
             os.chdir(old_cwd)
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_binding_the_launch_dir_through_a_symlink_replays_the_pin(self):
+        """The launch dir comes from getcwd() (a realpath); a later bind may spell the same directory
+        through a symlink.  It is still one workspace, so the rebuild replays the pinned snapshot."""
+        import os, tempfile, shutil
+        from pathlib import Path
+        from agent.system_prompt import build_system_prompt, invalidate_system_prompt
+
+        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-symlink-")).resolve()
+        old_cwd = os.getcwd()
+        try:
+            repo = _init_repo(tmp / "proj", "init commit")
+            link = tmp / "proj-link"
+            link.symlink_to(repo, target_is_directory=True)
+            os.chdir(repo)
+            agent = self._pin_agent()
+            with patch("agent.prompt_builder.load_soul_md", return_value=""), \
+                 patch("agent.prompt_builder.build_environment_hints", return_value="ENV HINTS"):
+                with patch("agent.system_prompt.resolve_context_cwd", return_value=None):
+                    p1 = build_system_prompt(agent)
+                self.assertIn("Status: clean", p1)
+                (repo / "untracked.txt").write_text("wip\n")
+                invalidate_system_prompt(agent)
+                with patch("agent.system_prompt.resolve_context_cwd", return_value=link):
+                    p2 = build_system_prompt(agent)
+            self.assertIn("Status: clean", p2)
+            self.assertNotIn("untracked", p2)
+        finally:
+            os.chdir(old_cwd)
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_agent_that_did_not_build_the_prompt_replays_the_persisted_snapshot(self):
         """Resume / gateway / TUI shape: a fresh agent rebuilds (compaction, a first /compress) after
         the repo moved and replays the snapshot its session row already holds — unless that prompt
@@ -260,7 +290,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
         from pathlib import Path
         from agent.system_prompt import build_system_prompt
 
-        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-resume-"))
+        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-resume-")).resolve()
         try:
             repo, other = _init_repo(tmp / "proj", "init commit"), _init_repo(tmp / "other", "init other")
 
@@ -290,7 +320,7 @@ class TestWorkspaceSnapshotPinnedAcrossCompaction(unittest.TestCase):
         from pathlib import Path
         from agent.system_prompt import build_system_prompt
 
-        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-empty-"))
+        tmp = Path(tempfile.mkdtemp(prefix="test-pinned-empty-")).resolve()
         try:
             repo = _init_repo(tmp / "proj", "init commit")
             stored = f"Host: x\nUser home directory: /h\nCurrent working directory: {repo}\n\nBODY"

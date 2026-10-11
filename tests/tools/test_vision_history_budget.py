@@ -199,6 +199,9 @@ class TestNativeTurnDedupe:
                             lambda *a, **kw: [{"function": {"name": "vision_analyze"}}])
         monkeypatch.setattr("model_tools.handle_function_call", _dispatch)
         monkeypatch.setattr(vision_tools, "_should_use_native_vision_fast_path", lambda: True)
+        # Hermetic: never probe whatever really listens on localhost:8080 (e.g. a dev llama-server).
+        monkeypatch.setattr("agent.context_compressor.get_model_context_length", lambda *a, **k: 128_000)
+        monkeypatch.setattr("agent.agent_init.query_ollama_num_ctx", lambda *a, **k: None)
 
         agent = AIAgent(model="test-model", api_key="test-key", base_url="http://localhost:8080/v1",
                         platform="cli", max_iterations=3, quiet_mode=True, skip_memory=True)

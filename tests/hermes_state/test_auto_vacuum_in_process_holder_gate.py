@@ -18,7 +18,16 @@ from __future__ import annotations
 
 import shutil
 
+import pytest
+
 import hermes_state_registry as registry
+from tests._fixtures.holder_scan import scan_only_own_process_tree
+
+
+@pytest.fixture(autouse=True)
+def _scan_only_own_process_tree(monkeypatch):
+    # The live host's processes would otherwise turn the holder scan into an unknown holder.
+    scan_only_own_process_tree(monkeypatch)
 
 
 def _seed(path):

@@ -13,9 +13,16 @@ from argparse import Namespace
 
 import pytest
 
-import hermes_cli.sessions_cmd as sessions_cmd
+from hermes_cli import sessions_cmd
+from tests._fixtures.holder_scan import scan_only_own_process_tree
 
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="holder scan is unavailable on Windows")
+pytestmark = pytest.mark.platforms("posix")  # holder scan is unavailable on Windows
+
+
+@pytest.fixture(autouse=True)
+def _scan_only_own_process_tree(monkeypatch):
+    # The live host's processes would otherwise turn the holder scan into an unknown holder.
+    scan_only_own_process_tree(monkeypatch)
 
 
 _HOLDER = (
@@ -72,9 +79,9 @@ def _sessions_subparsers():
     from hermes_cli.subcommands.sessions import build_sessions_parser
 
     build_sessions_parser(parser.add_subparsers(dest="command"), cmd_sessions=sessions_cmd.cmd_sessions)
-    subparsers = [a for a in parser._actions if isinstance(a, argparse._SubParsersAction)][0]
+    subparsers = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
     sessions = subparsers.choices["sessions"]
-    nested = [a for a in sessions._actions if isinstance(a, argparse._SubParsersAction)][0]
+    nested = next(a for a in sessions._actions if isinstance(a, argparse._SubParsersAction))
     return nested.choices
 
 

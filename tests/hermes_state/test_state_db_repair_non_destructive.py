@@ -69,14 +69,30 @@ import hermes_state
 import hermes_state_repair
 from hermes_state_repair import repair_state_db_schema
 
+from tests._fixtures.disk_space import report_ample_disk_space
+from tests._fixtures.holder_scan import scan_only_own_process_tree
+
+
+@pytest.fixture(autouse=True)
+def _scan_only_own_process_tree(monkeypatch):
+    # The live host's processes would otherwise turn the holder scan into an unknown holder.
+    scan_only_own_process_tree(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _report_ample_disk_space(monkeypatch):
+    # A nearly-full host volume would otherwise trip the repair/backup disk guards.
+    report_ample_disk_space(monkeypatch)
+
+
 PAGE_SIZE = 4096
 
 
 def _writer_after_stage(
     db_path: str,
-    ready: "multiprocessing.synchronize.Event",
-    start: "multiprocessing.synchronize.Event",
-    result: "multiprocessing.queues.Queue",
+    ready: multiprocessing.synchronize.Event,
+    start: multiprocessing.synchronize.Event,
+    result: multiprocessing.queues.Queue,
 ) -> None:
     """Try one real cross-process write after staging has begun.
 
@@ -807,7 +823,6 @@ def test_stale_scratch_is_removed_before_health_check(tmp_path, monkeypatch):
     def fake_health(_path):
         checks.append("health")
         assert not scratch.exists()
-        return None
 
     monkeypatch.setattr(hermes_state_repair, "_db_opens_cleanly", fake_health)
 

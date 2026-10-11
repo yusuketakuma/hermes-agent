@@ -15,6 +15,21 @@ import pytest
 from hermes_state import SessionDB
 from hermes_state_repair import _db_opens_cleanly, repair_state_db_schema
 
+from tests._fixtures.disk_space import report_ample_disk_space
+from tests._fixtures.holder_scan import scan_only_own_process_tree
+
+
+@pytest.fixture(autouse=True)
+def _scan_only_own_process_tree(monkeypatch):
+    # The live host's processes would otherwise turn the holder scan into an unknown holder.
+    scan_only_own_process_tree(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _report_ample_disk_space(monkeypatch):
+    # A nearly-full host volume would otherwise trip the repair/backup disk guards.
+    report_ample_disk_space(monkeypatch)
+
 
 def _build_db_with_trigram(db_path: Path) -> str:
     db = SessionDB(db_path=db_path)

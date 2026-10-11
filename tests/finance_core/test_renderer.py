@@ -7,6 +7,8 @@ import sys
 import os
 from pathlib import Path
 
+import pytest
+
 
 def test_renderer_falls_back_to_local_chromium_cli(
     tmp_path: Path,
@@ -106,3 +108,17 @@ def test_renderer_stops_chromium_after_pdf_is_ready(tmp_path: Path, monkeypatch)
     assert pdf.startswith(b"%PDF-1.7")
     assert len(process_holder) == 1
     assert process_holder[0].kwargs["start_new_session"] is True
+
+
+@pytest.mark.platforms("posix")
+def test_find_chromium_uses_the_user_path_browser(tmp_path: Path, monkeypatch):
+    """Chromium is a user-installed browser, not a Hermes-managed runtime: PATH decides."""
+    from finance_core.renderer import ChromiumPdfRenderer
+
+    browser = tmp_path / "chromium-browser"
+    browser.write_text("#!/bin/sh\n", encoding="utf-8")
+    browser.chmod(0o700)
+    monkeypatch.delenv("FINANCE_CORE_CHROMIUM", raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    assert ChromiumPdfRenderer._find_chromium() == str(browser)

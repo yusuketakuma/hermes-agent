@@ -5,8 +5,17 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 import hermes_state_common
 from hermes_state import SessionDB
+from tests._fixtures.holder_scan import scan_only_own_process_tree
+
+
+@pytest.fixture(autouse=True)
+def _scan_only_own_process_tree(monkeypatch):
+    # The live host's processes would otherwise turn the holder scan into an unknown holder.
+    scan_only_own_process_tree(monkeypatch)
 
 
 _HOLD_ADMISSION_SCRIPT = """

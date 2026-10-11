@@ -5,8 +5,6 @@ when the agent is working on a task. See PR fix for the @Lonely__MH report.
 """
 import asyncio
 import time
-import importlib.util
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -94,13 +92,14 @@ def _make_adapter(platform_val="telegram"):
     return adapter
 
 
-def _load_bot_conversation_plugin():
-    plugin_path = Path(__file__).resolve().parents[3] / "plugins" / "bot-conversation" / "__init__.py"
-    spec = importlib.util.spec_from_file_location("bot_conversation_gateway_test_plugin", plugin_path)
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+def _attest_bot_route(event=None, **_kwargs):
+    """The bot-conversation plugin's pre_gateway_dispatch contract: attest the route, take no action.
+
+    The plugin is installed under the user's HERMES_HOME, not in this repo, so core tests use this
+    stand-in instead of loading a host file.
+    """
+    event.metadata = {**(event.metadata or {}), "_bot_conversation_route_checked": True}
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -182,14 +181,10 @@ class TestBusySessionAck:
             text=f"種別={before}\n要約=hello", chat_id="1548242914268807228", platform_val="discord",
         )
         event.source.is_bot = True
-        plugin = _load_bot_conversation_plugin()
-        monkeypatch.setattr(
-            plugin, "_config", lambda: {"channel_id": "1548242914268807228"}
-        )
         monkeypatch.setattr(
             "hermes_cli.lifecycle.ainvoke_hook",
             AsyncMock(side_effect=lambda name, **kwargs: [
-                plugin._on_pre_gateway_dispatch(**kwargs),
+                _attest_bot_route(**kwargs),
                 {"action": "rewrite", "text": after_text},
             ] if name == "pre_gateway_dispatch" else []),
         )
@@ -278,7 +273,7 @@ class TestBusySessionAck:
     @pytest.mark.asyncio
     async def test_sends_ack_when_agent_running(self):
         """First message during busy session should get a status ack."""
-        runner, sentinel = _make_runner()
+        runner, _sentinel = _make_runner()
         runner._busy_input_mode = "interrupt"
         adapter = _make_adapter()
 
@@ -322,8 +317,8 @@ class TestBusySessionAck:
         import gateway.run as _gr
 
         monkeypatch.delenv("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED", raising=False)
-        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
-        runner, sentinel = _make_runner()
+        monkeypatch.setattr(_gr, "_load_gateway_config", dict)
+        runner, _sentinel = _make_runner()
         runner._busy_input_mode = "steer"
         adapter = _make_adapter()
 
@@ -490,7 +485,7 @@ class TestBusySessionAck:
             source=source, session_key=build_session_key(source), session_id="session-id",
             run_generation=None, _interrupt_depth=0, history=[], context_prompt="",
             _status_thread_metadata=None, event_message_id=None, inbound_message_id=None,
-            turn_policy=None, mute_notification_reply=False,
+            turn_policy=None, channel_prompt=None, mute_notification_reply=False,
             agent_holder=[MagicMock()], result_holder=[None],
             stream_consumer_holder=[None], streaming_tts_consumer_holder=[None],
         )
@@ -558,7 +553,7 @@ class TestBusySessionAck:
             source=source, session_key=build_session_key(source), session_id="session-id",
             run_generation=None, _interrupt_depth=0, history=[], context_prompt="",
             _status_thread_metadata=None, event_message_id=None, inbound_message_id=None,
-            turn_policy=None, mute_notification_reply=False,
+            turn_policy=None, channel_prompt=None, mute_notification_reply=False,
             agent_holder=[MagicMock()], result_holder=[None],
             stream_consumer_holder=[None], streaming_tts_consumer_holder=[None],
         )
@@ -634,7 +629,7 @@ class TestBusySessionAck:
             source=source, session_key=session_key, session_id="session-id", run_generation=None,
             _interrupt_depth=0, history=[], context_prompt="", _status_thread_metadata=None,
             event_message_id=None, inbound_message_id=None, turn_policy=None,
-            mute_notification_reply=False,
+            channel_prompt=None, mute_notification_reply=False,
             agent_holder=[MagicMock()], result_holder=[None], stream_consumer_holder=[consumer],
             streaming_tts_consumer_holder=[None], stream_task_drained=False,
         )
@@ -746,11 +741,11 @@ class TestBusySessionAck:
             await GatewayRunner._await_stream_task(stream_task)
 
     @pytest.mark.asyncio
-    async def test_proxy_typing_cancellation_finishes_stream_task(self, monkeypatch):
+    async def test_proxy_typing_cancellation_finishes_stream_task(self):
         from gateway.run import GatewayRunner
 
-        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://127.0.0.1:8642")
         runner, _sentinel = _make_runner()
+        runner._get_proxy_url = lambda: "http://127.0.0.1:8642"
         source = SessionSource(platform=Platform.MATRIX, chat_id="room", chat_type="group")
         typing_started = asyncio.Event()
         stream_finished = asyncio.Event()
@@ -939,7 +934,7 @@ class TestBusySessionAck:
         import gateway.run as _gr
 
         monkeypatch.delenv("HERMES_GATEWAY_BUSY_STEER_ACK_ENABLED", raising=False)
-        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+        monkeypatch.setattr(_gr, "_load_gateway_config", dict)
         runner, _sentinel = _make_runner()
         runner._busy_input_mode = "steer"
         runner._should_echo_stt_transcripts = MagicMock(return_value=False)
@@ -978,7 +973,7 @@ class TestBusySessionAck:
     @pytest.mark.asyncio
     async def test_steer_mode_falls_back_to_queue_when_agent_rejects(self):
         """If agent.steer() returns False, fall back to queue behavior."""
-        runner, sentinel = _make_runner()
+        runner, _sentinel = _make_runner()
         runner._busy_input_mode = "steer"
         adapter = _make_adapter()
 
@@ -1092,7 +1087,7 @@ class TestBusySessionAck:
             "_load_gateway_config",
             lambda: {"display": {"platforms": {"telegram": {"busy_ack_detail": True}}}},
         )
-        runner, sentinel = _make_runner()
+        runner, _sentinel = _make_runner()
         runner._busy_input_mode = "interrupt"
         adapter = _make_adapter()
 
@@ -1131,7 +1126,7 @@ class TestBusySessionOnboardingHint:
         monkeypatch.setattr(_gr, "_hermes_home", tmp_path)
         # mark_seen imports utils.atomic_yaml_write; make sure it resolves
         # against a writable dir by pointing _hermes_home at tmp_path.
-        monkeypatch.setattr(_gr, "_load_gateway_config", lambda: {})
+        monkeypatch.setattr(_gr, "_load_gateway_config", dict)
 
         runner, _sentinel = _make_runner()
         runner._busy_input_mode = "interrupt"
@@ -1155,7 +1150,7 @@ class TestBusySessionOnboardingHint:
         adapter._send_with_retry.assert_called_once()
 
         # The flag is now persisted to tmp_path/config.yaml
-        import yaml
+        import hermes_yaml as yaml
         cfg = yaml.safe_load((tmp_path / "config.yaml").read_text())
         assert cfg["onboarding"]["seen"]["busy_input_prompt"] is True
 

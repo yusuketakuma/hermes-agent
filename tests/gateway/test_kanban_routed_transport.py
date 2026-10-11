@@ -113,6 +113,11 @@ def test_user_routed_subscription_uses_only_its_authorized_profile(tmp_path, mon
     runner.config.profile_routes = parse_profile_routes([
         dict(platform="discord", user_id="creator", profile="yuki"),
     ])
+    # The owner profile's Discord allowlist must also authorize the shared chat.
+    (tmp_path / ".hermes" / "profiles" / "yuki" / "config.yaml").write_text(
+        "discord:\n  server_targets:\n    - guild_id: guild\n      channel_ids:\n        - shared\n",
+        encoding="utf-8",
+    )
 
     routed = completion(profile="yuki", chat="shared", thread="")
     rows = collect(runner)

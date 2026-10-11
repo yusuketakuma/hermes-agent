@@ -126,7 +126,10 @@ def test_decompose_fanout_children_inherit_root_assignee_when_unrouted(kanban_ho
     (an incognito profile with no credentials), so the old fallback spawned
     workers that deadlocked on capability blockers."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="ship it", assignee="zdr", triage=True)
+        tid = kb.create_task(
+            conn, title="ship it", assignee="zdr", triage=True,
+            execution_scope={"allowed_assignees": ["zdr"], "max_children": 2, "max_descendants": 2},
+        )
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -170,7 +173,12 @@ def test_decompose_explicit_default_assignee_wins_over_root_assignee(kanban_home
     fills in when no explicit default is set (explicit config → card
     assignee → active profile)."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="ship it", assignee="engineer", triage=True)
+        tid = kb.create_task(
+            conn, title="ship it", assignee="engineer", triage=True,
+            execution_scope={
+                "allowed_assignees": ["engineer", "docs"], "max_children": 2, "max_descendants": 2,
+            },
+        )
 
     llm_payload = jsonlib.dumps({
         "fanout": True,

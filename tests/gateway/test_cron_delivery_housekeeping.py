@@ -3,7 +3,7 @@
 from contextlib import contextmanager
 from types import SimpleNamespace
 
-import cron.scheduler as scheduler
+from cron import scheduler
 from cron import scheduler_preflight as sched_preflight
 import gateway.run as gateway_run
 
@@ -86,6 +86,9 @@ def test_multiplex_housekeeping_scopes_primary_and_drains_each_profile(
     monkeypatch.setattr(gateway_run, "_profile_runtime_scope", fake_scope)
     from gateway import run_profile_reconcile
     monkeypatch.setattr(run_profile_reconcile, "_mcp_config_reconciler", lambda runner: lambda: None)
+    # The per-tick plugin update chore also binds every served profile's scope; this test
+    # asserts the DRAIN's scope sequence, so keep the chore wrapper out of the recording.
+    monkeypatch.setattr(run_profile_reconcile, "_for_each_served_profile", lambda runner, body: None)
     monkeypatch.setattr(
         scheduler,
         "drain_delivery_queue",
@@ -171,7 +174,7 @@ def test_primary_drain_delivers_credentialless_satellite_queue_row_through_prima
     import threading
     from unittest.mock import patch
 
-    import yaml
+    import hermes_yaml as yaml
 
     from cron import delivery_queue
     from gateway.config import Platform
@@ -186,7 +189,11 @@ def test_primary_drain_delivers_credentialless_satellite_queue_row_through_prima
     }), encoding="utf-8")
     # The satellite names its home channel but holds no token: block present, ``enabled`` False.
     (satellite_home / "config.yaml").write_text(
-        yaml.safe_dump({"platforms": {"discord": {"home_channel": "C1"}}}), encoding="utf-8")
+        yaml.safe_dump({
+            "platforms": {"discord": {"home_channel": "C1"}},
+            # The local Discord egress policy only sends to exact allowlisted channels.
+            "discord": {"server_targets": [{"guild_id": "G1", "channel_ids": ["C1"]}]},
+        }), encoding="utf-8")
     monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: root)
     monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
 

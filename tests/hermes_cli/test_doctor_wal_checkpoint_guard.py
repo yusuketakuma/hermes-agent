@@ -9,6 +9,7 @@ from pathlib import Path
 import hermes_state_repair
 from hermes_cli.doctor_report import Finding
 from hermes_cli.doctor_state import _state_db_wal
+from tests._fixtures.holder_scan import scan_only_own_process_tree
 
 
 def _large_wal_db(tmp_path):
@@ -26,6 +27,7 @@ def _large_wal_db(tmp_path):
 
 def test_doctor_checkpoint_runs_only_on_the_exclusive_repair_guard(tmp_path, monkeypatch):
     db = _large_wal_db(tmp_path)
+    scan_only_own_process_tree(monkeypatch)
 
     bare_connects: list[str] = []
     real_connect = sqlite3.connect

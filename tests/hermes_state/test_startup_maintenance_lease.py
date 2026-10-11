@@ -9,8 +9,18 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 import hermes_startup_watchdog as sw
 from hermes_state import SessionDB
+
+from tests._fixtures.holder_scan import scan_only_own_process_tree
+
+
+@pytest.fixture(autouse=True)
+def _scan_only_own_process_tree(monkeypatch):
+    # The live host's processes would otherwise turn the holder scan into an unknown holder.
+    scan_only_own_process_tree(monkeypatch)
 
 
 def test_maintenance_steps_renew_the_armed_watchdog_lease(tmp_path, monkeypatch):

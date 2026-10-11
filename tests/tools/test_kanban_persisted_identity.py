@@ -33,7 +33,10 @@ def board_env(tmp_path, monkeypatch):
     kb.init_db()
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="identity-test", assignee="alpha")
+        # A worker may only fan out within its card's execution_scope; grant the child
+        # assignee and room for the three kanban_create calls below.
+        tid = kb.create_task(conn, title="identity-test", assignee="alpha", execution_scope={
+            "allowed_assignees": ["alpha", "peer"], "max_children": 3, "max_descendants": 3})
         kb.claim_task(conn, tid)
     finally:
         conn.close()
@@ -88,14 +91,14 @@ def test_a_dispatched_worker_keeps_its_pinned_identity_and_an_unnamed_caller_sta
     """Control: no override → the dispatcher's ``HERMES_PROFILE`` pin wins over the process home;
     absence: nothing names a profile and the home is not a profile → ``"worker"``."""
     from tools import kanban_tools as kt
-    root, tid = board_env
+    _root, tid = board_env
 
     monkeypatch.setenv("HERMES_PROFILE", "pinned-bot")
     assert json.loads(kt._handle_comment({"task_id": tid, "body": "from env"}))["ok"]
     assert _last_comment_author(tid) == "pinned-bot"
 
     monkeypatch.delenv("HERMES_PROFILE")
-    import hermes_cli.profiles as profiles
+    from hermes_cli import profiles
     monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "")
     assert json.loads(kt._handle_comment({"task_id": tid, "body": "anon"}))["ok"]
     assert _last_comment_author(tid) == "worker"

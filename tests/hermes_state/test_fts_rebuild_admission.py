@@ -34,6 +34,14 @@ pytestmark = pytest.mark.skipif(
     sys.platform == "win32", reason="POSIX flock child-process harness"
 )
 
+from tests._fixtures.holder_scan import scan_only_own_process_tree
+
+
+@pytest.fixture(autouse=True)
+def _scan_only_own_process_tree(monkeypatch):
+    # The live host's processes would otherwise turn the holder scan into an unknown holder.
+    scan_only_own_process_tree(monkeypatch)
+
 
 _HOLD_LOCK_SCRIPT = """
 import sys, time, fcntl, pathlib
@@ -170,7 +178,7 @@ class TestSchemaPathAdmission:
         # Drop one sync trigger out-of-band: next open takes the
         # triggers_need_repair branch in _init_schema.
         raw = sqlite3.connect(str(db_path))
-        raw.execute(f"DROP TRIGGER IF EXISTS {sorted(_FTS_TRIGGERS)[0]}")
+        raw.execute(f"DROP TRIGGER IF EXISTS {min(_FTS_TRIGGERS)}")
         raw.commit()
         raw.close()
 
@@ -334,13 +342,13 @@ class TestOrphanedHolderStalenessBreak:
         db_path = tmp_path / "state.db"
         db_path.touch()
 
-        script = """
+        script = f"""
 import os, sys, time
-sys.path.insert(0, {repo!r})
+sys.path.insert(0, {str(Path(hermes_state_common.__file__).parent)!r})
 from pathlib import Path
 import hermes_state_repair
 
-lock_cm = hermes_state_repair._cross_process_repair_lock(Path({db!r}))
+lock_cm = hermes_state_repair._cross_process_repair_lock(Path({str(db_path)!r}))
 assert lock_cm.__enter__() is True
 pid = os.fork()
 if pid == 0:
@@ -348,7 +356,7 @@ if pid == 0:
     os._exit(0)
 print("child", pid, flush=True)
 os._exit(1)
-""".format(repo=str(Path(hermes_state_common.__file__).parent), db=str(db_path))
+"""
         import os
         import signal
 

@@ -45,6 +45,14 @@ from hermes_cli.backup import (
 # Fixtures — real WAL-mode SessionDB in tmp dirs
 # ---------------------------------------------------------------------------
 
+from tests._fixtures.holder_scan import scan_only_own_process_tree
+
+
+@pytest.fixture(autouse=True)
+def _scan_only_own_process_tree(monkeypatch):
+    # The live host's processes would otherwise turn the holder scan into an unknown holder.
+    scan_only_own_process_tree(monkeypatch)
+
 
 def _make_state_db(tmp_path: Path) -> Path:
     db = tmp_path / "state.db"
@@ -113,7 +121,7 @@ class _LiveWriter:
             if conn is not None:
                 conn.close()
 
-    def __enter__(self) -> "_LiveWriter":
+    def __enter__(self) -> _LiveWriter:
         self.thread.start()
         assert self.ready.wait(timeout=30), "live writer never acquired lock"
         if self.error is not None:

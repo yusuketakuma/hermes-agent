@@ -15,6 +15,14 @@ import hermes_state
 import hermes_state_repair
 from hermes_state_repair import repair_state_db_schema
 
+from tests._fixtures.holder_scan import scan_only_own_process_tree
+
+
+@pytest.fixture(autouse=True)
+def _scan_only_own_process_tree(monkeypatch):
+    # The live host's processes would otherwise turn the holder scan into an unknown holder.
+    scan_only_own_process_tree(monkeypatch)
+
 
 def _make_db(path):
     conn = sqlite3.connect(str(path), isolation_level=None)
