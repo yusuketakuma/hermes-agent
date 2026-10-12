@@ -1224,3 +1224,31 @@ class TestLongRunningNotificationOwnership:
         assert runner._should_emit_long_running_notification("sess", agent, executor_task=None) is True
         setattr(runner, flag, True)
         assert runner._should_emit_long_running_notification("sess", agent, executor_task=None) is False
+
+
+@pytest.mark.parametrize("key", ["turn_policy", "gateway_proven_session_id"])
+@pytest.mark.parametrize("different", [False, True])
+def test_photo_queue_keeps_both_companion_and_upstream_security_boundaries(key, different):
+    runner, _ = _make_runner()
+    adapter = _make_adapter()
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", user_id="user1")
+    first_value = {"route": "local"} if key == "turn_policy" else "synthetic-session-a"
+    second_value = ({"route": "formal"} if key == "turn_policy" else "synthetic-session-b") \
+        if different else first_value
+    first = MessageEvent(text="first", message_type=MessageType.PHOTO, source=source,
+                         message_id="synthetic-first", media_urls=["https://synthetic.invalid/a"],
+                         metadata={key: first_value})
+    second = MessageEvent(text="second", message_type=MessageType.PHOTO, source=source,
+                          message_id="synthetic-second", media_urls=["https://synthetic.invalid/b"],
+                          metadata={key: second_value})
+    sk = build_session_key(source)
+    runner.adapters[Platform.TELEGRAM] = adapter
+    adapter._pending_messages[sk] = first
+    runner._queue_or_replace_pending_event(sk, second)
+    assert adapter._pending_messages[sk] is first
+    if different:
+        assert runner._queued_events[sk] == [second]
+        assert first.media_urls == ["https://synthetic.invalid/a"]
+    else:
+        assert first.media_urls == ["https://synthetic.invalid/a", "https://synthetic.invalid/b"]
+        assert not runner._queued_events.get(sk)

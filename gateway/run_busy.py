@@ -381,6 +381,7 @@ class GatewayBusySessionMixin:
     _SECURITY_METADATA_KEYS = (
         "hermes_plugin_id", "hermes_plugin_injection", "gateway_session_key",
         "gateway_session_id", "gateway_session_strict", "turn_policy",
+        "gateway_proven_session_id",
         "notification_category",
     )
 
