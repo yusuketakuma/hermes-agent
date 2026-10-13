@@ -325,3 +325,9 @@ native/fts5_cjk/*.so
 /pm/.lock.json.lock
 
 apps/desktop/.dist-build*
+
+# Local agent session and audit state is not distributable source.
+/.claude/sessions/
+/.claude/state/
+/.omc/state/
+/.devin/audit-ledger-*
